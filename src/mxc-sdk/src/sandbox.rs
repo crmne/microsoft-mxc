@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! The SDK's sandbox handle: a crate-owned facade over the internal
-//! `mxc_common` streaming handle, so the public API never exposes the
-//! foundation crate's traits.
+//! SDK container lifecycle operations and live process handles. The handles
+//! wrap an internal `mxc_common` streaming handle so the public API never
+//! exposes the foundation crate's traits.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

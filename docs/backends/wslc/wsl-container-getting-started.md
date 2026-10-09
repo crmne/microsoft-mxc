@@ -143,7 +143,7 @@ cost once per image, not once per run.
 
 > **Bring-up reaches the network.** A cache miss makes the host fetch
 > from the image's registry before the container starts. That fetch is
-> outside the sandbox's own network policy, so a config declaring
+> outside the container's own network policy, so a config declaring
 > `network.egress.default: "deny"` is **refused** rather than pulled —
 > warm the cache first, or set `wslc.imageTarPath`. A config that
 > allows egress pulls on a miss.
@@ -348,10 +348,15 @@ The separate `provision` operation takes the same list under
 }
 ```
 
-The lifecycle daemon creates one container per sandbox, so a forward belongs
-to the sandbox that declared it. The session-wide `cpuCount` / `memoryMb` /
-`gpu` / `storagePath` settings remain available only for create-and-run execution, because that daemon shares a
-single WSL session across every sandbox.
+The lifecycle daemon creates a separate container for each provisioned identity,
+so a forward belongs to the container that declares it. The session-wide
+`cpuCount` / `memoryMb` / `gpu` / `storagePath` settings remain available only
+for create-and-run execution, because the daemon shares a single WSL session
+across all containers.
+
+Both forwarding paths use WSLC's configured default host binding address.
+Check the [binding guidance](wslc-state-aware.md#port-mappings) before relying
+on host-only access to a mapped port.
 
 ### Image sources
 
@@ -592,7 +597,7 @@ container to persist — its daemon holds the session open across phase processe
 policy-persistence primitive, so there is nothing for the flag to select.
 
 Container lifecycle JSON requests differ: they reject the whole `lifecycle` section
-at parse time, because a multi-invocation sandbox's lifetime is driven by the
+at parse time, because a multi-invocation container's lifetime is driven by the
 explicit `provision` / `deprovision` phases rather than by per-run flags.
 
 ## Supported workloads

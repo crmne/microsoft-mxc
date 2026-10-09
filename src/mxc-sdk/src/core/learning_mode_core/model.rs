@@ -123,7 +123,7 @@ pub struct DeniedResource {
     /// Access type the workload was attempting (see [`AccessType`]).
     pub access_type: AccessType,
 
-    /// Process ID inside the sandbox that triggered the denial. Network
+    /// Process ID of the workload that triggered the denial. Network
     /// decisions use `0` when the normalized broker event does not contain a
     /// reliable workload process ID.
     pub pid: u32,

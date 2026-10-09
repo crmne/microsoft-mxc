@@ -43,7 +43,7 @@ Sandbox daemon pattern.
 The daemon owns the live SDK handles on a **single apartment-affine worker thread**, which services
 every lifecycle command. Any thread that has joined the MTA may use those handles, so an image
 pull and an `exec` each run on an MTA thread of their own and post their outcome back to the
-worker, leaving it free to serve other sandboxes for the duration of a run. A second `exec` on a
+worker, leaving it free to serve other containers for the duration of a run. A second `exec` on a
 container with a run in flight is refused as `busy`; a lifecycle command naming that container
 waits for the run, because deleting the container would free a handle the run is using. See
 [Known limitations](#known-limitations).
@@ -69,7 +69,7 @@ request type is converted once by its adapter; the backend uses the runtime
 
 ### Port mappings
 
-`wslc.provision.portMappings` forwards host ports into the sandbox's container,
+`wslc.provision.portMappings` forwards host ports into the container,
 using the same entry shape as the create-and-run `wslc.portMappings` list:
 
 ```json
@@ -107,12 +107,14 @@ one duplicate check, so two entries claiming the same `windowsPort` are
 rejected identically. Zero ports and non-TCP protocols are rejected when the
 version-specific JSON request is deserialized.
 
-The forward listens on `127.0.0.1` only, so a mapped port reaches the container
-from the host itself and not from other machines. WSLC installs it when the
-container starts rather than at provision, so a `windowsPort` that another
-process already holds on loopback fails the `start` phase, not `provision`.
+MXC leaves the host binding address unspecified, so WSLC uses its configured
+default. A loopback binding limits the forward to the host; a default binding
+of `0.0.0.0` may expose the port to other machines, subject to host firewall
+rules. Check that setting before relying on host-only access. WSLC installs
+the forward when the container starts rather than at provision, so a
+conflicting host binding fails the `start` phase, not `provision`.
 
-## Sandbox IDs
+## Container IDs
 
 `provision` mints an id of the form `wslc:<32 lowercase hex>` (`wslc:` + a UUID simple form).
 "MXC request JSON" carries this id in `sandboxId` for every post-provision phase
@@ -154,7 +156,7 @@ exec's slot is held until the run has reported back and its client has been
 written to, so a client that disconnects mid-run keeps counting against that
 bound while its process is still going, and one that drains slowly keeps
 counting while its output is still queued. A run whose termination could not be
-confirmed leaves its sandbox quarantined and keeps the slot until that sandbox
+confirmed leaves its container quarantined and keeps the slot until that container
 is deprovisioned, because the process may still be alive.
 
 Three conditions surface as `busy`, and all reach an SDK caller as
@@ -310,7 +312,7 @@ proxy, validation rejections, exec concurrency, and idle teardown. Fixtures live
 `tests/configs/wslc_state_aware_*.json`.
 
 The concurrency section launches a phase without waiting for it (`Start-StateAware` /
-`Wait-StateAware`), which is what lets it observe two sandboxes running at once, a refused
+`Wait-StateAware`), which is what lets it observe two containers running at once, a refused
 same-container second exec, and a lifecycle command issued while a run is in flight. Every other
 section drives one phase process at a time.
 
@@ -319,7 +321,7 @@ section drives one phase process at a time.
 The `wslc_state_aware_*.json` test inputs describe **container lifecycle operations**: unlike create-and-run configs, they cannot be
 run individually or in an arbitrary order:
 
-- **Order is mandatory.** A sandbox must go through `provision → start → exec… → stop → deprovision`.
+- **Order is mandatory.** A container must go through `provision → start → exec… → stop → deprovision`.
   `provision` is what boots the session and mints the id; every other phase fails without it
   (`start`/`exec` before provision → `not_provisioned` / `not_started`, and any phase after
   `deprovision` → `not_provisioned`).
@@ -337,8 +339,8 @@ fixtures **through the harness**, not by pointing `wxc-exec --config` at them di
 ## Known limitations
 
 - **Ordering is per-container, not global.** A lifecycle command naming a container with a run in
-  flight waits for that run; commands for other sandboxes proceed independently. A caller cannot
-  infer that work on one sandbox completed because work on another did.
+  flight waits for that run; commands for other containers proceed independently. A caller cannot
+  infer that work on one container completed because work on another did.
 
 - **`busy` collapses to `backend_error` (deferred).** A refused exec reaches an SDK caller as a
   generic `backend_error` with no indication that retrying would succeed. A retryable error code
