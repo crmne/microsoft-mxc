@@ -55,7 +55,7 @@ use crate::mxc_common::string_util;
 use crate::mxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
 use crate::process_container_common::base_container_helpers::{
     build_psec_v1_security_environment_spec, has_conflicting_proxy_identity,
-    unrestricted_host_loopback_allowed,
+    psec_1_0_direct_loopback_policy, unrestricted_host_loopback_allowed,
 };
 use crate::process_container_common::capture_output::{
     combine_capture_and_cleanup_results, combine_process_and_teardown_results,
@@ -408,11 +408,21 @@ impl BaseContainerRunner {
         Self::psec_1_0_only(supports_version)
     }
 
+    fn psec_1_0_direct_loopback_workaround(
+        request: &ExecutionRequest,
+        supports_version: impl FnMut(SecurityEnvironmentVersion) -> Result<bool, LearningModeError>,
+    ) -> Result<bool, LearningModeError> {
+        if !psec_1_0_direct_loopback_policy(request) {
+            return Ok(false);
+        }
+        Self::psec_1_0_only(supports_version)
+    }
+
     /// The single PSEC version-selection point: start at 1.0 and raise it to
     /// the highest version required by any requested native feature.
     fn choose_min_required_psec_version_for_request(
         request: &ExecutionRequest,
-        proxy_loopback_workaround: bool,
+        psec_1_0_loopback_workaround: bool,
     ) -> SecurityEnvironmentVersion {
         let mut version = SecurityEnvironmentVersion::V1_0;
         if !request.policy.denied_paths.is_empty() {
@@ -422,7 +432,7 @@ impl BaseContainerRunner {
             version =
                 version.max(SecurityEnvironmentSupport::FileSystemEnumerate.required_version());
         }
-        if unrestricted_host_loopback_allowed(&request.policy) && !proxy_loopback_workaround {
+        if unrestricted_host_loopback_allowed(&request.policy) && !psec_1_0_loopback_workaround {
             version = version.max(SecurityEnvironmentSupport::NetworkIngress.required_version());
         }
         version
@@ -470,6 +480,10 @@ impl BaseContainerRunner {
                 Self::psec_1_0_proxy_loopback_workaround(request, secenv::supports_version),
                 Ok(true)
             )
+            && !matches!(
+                Self::psec_1_0_direct_loopback_workaround(request, secenv::supports_version),
+                Ok(true)
+            )
         {
             return BaseContainerRequestDecision::IngressUnsupported;
         }
@@ -511,8 +525,19 @@ impl BaseContainerRunner {
                     ))
                 },
             )?;
-        let psec_version =
-            Self::choose_min_required_psec_version_for_request(request, proxy_loopback_workaround);
+        let direct_loopback_workaround =
+            Self::psec_1_0_direct_loopback_workaround(request, secenv::supports_version).map_err(
+                |error| ScriptResponse {
+                    failure_phase: FailurePhase::BackendUnavailable,
+                    ..ScriptResponse::error(&format!(
+                        "failed to query PSEC direct host-loopback compatibility support: {error}"
+                    ))
+                },
+            )?;
+        let psec_version = Self::choose_min_required_psec_version_for_request(
+            request,
+            proxy_loopback_workaround || direct_loopback_workaround,
+        );
         let version_supported =
             secenv::supports_version(psec_version).map_err(|error| ScriptResponse {
                 failure_phase: FailurePhase::BackendUnavailable,
@@ -3025,6 +3050,166 @@ mod tests {
             address: Some(ProxyAddress::new("127.0.0.1".to_string(), 8080)),
         };
         request
+    }
+
+    fn psec_1_0_direct_loopback_request() -> ExecutionRequest {
+        let mut request = host_loopback_request();
+        request.policy.network_egress = Some(NetworkEgressPolicy {
+            default: NetworkAction::Allow,
+            ..Default::default()
+        });
+        request
+    }
+
+    #[test]
+    fn psec_1_0_direct_loopback_requires_a_1_0_only_host() {
+        let request = psec_1_0_direct_loopback_request();
+        for (supports_1_0, supports_1_1, expected) in [
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                BaseContainerRunner::psec_1_0_direct_loopback_workaround(&request, |version| {
+                    Ok(if version == SecurityEnvironmentVersion::V1_1 {
+                        supports_1_1
+                    } else {
+                        supports_1_0
+                    })
+                })
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn psec_1_0_direct_loopback_rejects_other_network_postures_without_querying() {
+        for case in 0..8 {
+            let mut request = psec_1_0_direct_loopback_request();
+            match case {
+                0 => request.policy.network_egress.as_mut().unwrap().default = NetworkAction::Deny,
+                1 => request
+                    .policy
+                    .network_egress
+                    .as_mut()
+                    .unwrap()
+                    .allow
+                    .push(NetworkRule::default()),
+                2 => request
+                    .policy
+                    .network_egress
+                    .as_mut()
+                    .unwrap()
+                    .deny
+                    .push(NetworkRule::default()),
+                3 => request.policy.network_ingress.as_mut().unwrap().default = NetworkAction::Deny,
+                4 => {
+                    request
+                        .policy
+                        .network_ingress
+                        .as_mut()
+                        .unwrap()
+                        .host_loopback = NetworkAction::Deny;
+                }
+                5 => request.policy.runtime_network_proxy_specified = true,
+                6 => {
+                    request.policy.network_proxy = ProxyConfig {
+                        address: Some(ProxyAddress::new("127.0.0.1".to_string(), 8080)),
+                    };
+                }
+                7 => request.policy.allowed_proxy_peer = Some("Contoso.Proxy_123".to_string()),
+                _ => unreachable!(),
+            }
+            assert!(!BaseContainerRunner::psec_1_0_direct_loopback_workaround(
+                &request,
+                |_| panic!("ineligible policy must not query the OS"),
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn psec_1_0_direct_loopback_version_query_failure_is_not_support() {
+        let request = psec_1_0_direct_loopback_request();
+        for failing_version in [
+            SecurityEnvironmentVersion::V1_0,
+            SecurityEnvironmentVersion::V1_1,
+        ] {
+            let result =
+                BaseContainerRunner::psec_1_0_direct_loopback_workaround(&request, |version| {
+                    if version == failing_version {
+                        Err(LearningModeError::HResultCall {
+                            function: "IsProcessSecurityEnvironmentVersionSupported",
+                            code: E_NOTIMPL.0,
+                        })
+                    } else {
+                        Ok(false)
+                    }
+                });
+            assert!(matches!(result, Err(LearningModeError::HResultCall { .. })));
+        }
+    }
+
+    #[test]
+    fn psec_1_0_direct_loopback_encodes_capability_peer_and_egress() {
+        let request = psec_1_0_direct_loopback_request();
+        let version =
+            BaseContainerRunner::choose_min_required_psec_version_for_request(&request, true);
+        assert_eq!(version, SecurityEnvironmentVersion::V1_0);
+        let bytes = build_psec_v1_security_environment_spec(&request, version, false);
+        let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
+        let network = spec.network_policy().unwrap();
+
+        assert_eq!(spec.version().minor(), 0);
+        assert_eq!(
+            spec.capabilities().unwrap().split(',').collect::<Vec<_>>(),
+            [
+                "internetClient",
+                "privateNetworkClientServer",
+                "networkLoopback"
+            ]
+        );
+        assert_eq!(
+            network.allowed_appcontainer_peer(),
+            Some(crate::process_container_common::base_container_helpers::LOOPBACK_NETWORK_PEER)
+        );
+        assert_eq!(
+            network.egress().unwrap().default_action(),
+            psec_layout::FilterAction::allow
+        );
+        assert!(network.proxy().is_none());
+        assert!(network.ingress().is_none());
+
+        let bytes = build_psec_v1_security_environment_spec(
+            &request,
+            SecurityEnvironmentVersion::V1_1,
+            true,
+        );
+        let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
+        assert!(!spec
+            .capabilities()
+            .unwrap()
+            .split(',')
+            .any(|capability| capability == "networkLoopback"));
+        assert_eq!(
+            spec.network_policy()
+                .unwrap()
+                .ingress()
+                .unwrap()
+                .host_loopback(),
+            psec_layout::FilterAction::allow
+        );
+    }
+
+    #[test]
+    fn psec_1_0_direct_loopback_keeps_other_native_version_requirements() {
+        let mut request = psec_1_0_direct_loopback_request();
+        request.policy.enumerate_paths = vec!["C:\\tools".to_string()];
+        assert_eq!(
+            BaseContainerRunner::choose_min_required_psec_version_for_request(&request, true),
+            SecurityEnvironmentVersion::V1_1
+        );
     }
 
     #[test]

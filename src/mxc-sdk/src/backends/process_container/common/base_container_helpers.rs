@@ -27,6 +27,21 @@ pub(super) fn has_conflicting_proxy_identity(policy: &ContainerPolicy) -> bool {
     policy.allowed_proxy_peer.is_some() && unrestricted_host_loopback_allowed(policy)
 }
 
+pub(super) fn psec_1_0_direct_loopback_policy(request: &ExecutionRequest) -> bool {
+    let policy = &request.policy;
+    !policy.runtime_network_proxy_specified
+        && !policy.network_proxy.is_enabled()
+        && policy.allowed_proxy_peer.is_none()
+        && policy.network_egress.as_ref().is_some_and(|egress| {
+            egress.default == NetworkAction::Allow
+                && egress.allow.is_empty()
+                && egress.deny.is_empty()
+        })
+        && policy.network_ingress.as_ref().is_some_and(|ingress| {
+            ingress.default == NetworkAction::Allow && ingress.host_loopback == NetworkAction::Allow
+        })
+}
+
 pub(super) fn build_psec_v1_security_environment_spec(
     request: &ExecutionRequest,
     version: SecurityEnvironmentVersion,
@@ -38,10 +53,11 @@ pub(super) fn build_psec_v1_security_environment_spec(
     );
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(1024);
     let mut capabilities = effective_capabilities(&request.policy);
-    if request.policy.network_proxy.is_enabled()
-        && unrestricted_host_loopback_allowed(&request.policy)
+    if (request.policy.network_proxy.is_enabled()
+        && unrestricted_host_loopback_allowed(&request.policy))
+        || (version == SecurityEnvironmentVersion::V1_0 && psec_1_0_direct_loopback_policy(request))
     {
-        // Proxy mode cannot carry the native ingress table that grants loopback.
+        // Neither PSEC 1.0 nor proxy mode can carry the native ingress table.
         ensure_capability(&mut capabilities, "networkLoopback");
     }
     let ui_restrictions = crate::process_container_common::job_object::to_job_object_uilimit_mask(

@@ -116,11 +116,18 @@ host-loopback setting selects both the `networkLoopback` capability and the `MXC
 identity-scoped proxy peer. The peer alone is insufficient: without the capability, the environment can be created
 but its client cannot reach the host proxy.
 The public ingress policy remains required. Direct-egress host-loopback allow
-requires PSEC 1.1 and the ingress support flag. For an identity-less
-`runtimeConfig.networkProxy` with explicit `hostLoopback: "allow"`, MXC also
-supports a compatibility workaround on hosts that support PSEC 1.0 but not 1.1.
+normally requires PSEC 1.1 and the ingress support flag. On PSEC 1.0-only
+hosts, a compatibility path accepts the explicit combination
+`egress.default: "allow"` with no egress rules,
+`ingress.default: "allow"`, and `ingress.hostLoopback: "allow"`, without a
+runtime proxy or `allowedProxyPeer`. It uses the `networkLoopback` capability
+and `MXC-Loopback` peer instead of the native ingress table. Other direct-egress
+host-loopback policies still require PSEC 1.1 with ingress support.
+For an identity-less `runtimeConfig.networkProxy` with explicit
+`hostLoopback: "allow"`, MXC also supports a compatibility workaround on hosts
+that support PSEC 1.0 but not 1.1.
 Hosts that support PSEC 1.1 or newer must still advertise the ingress support
-flag; accepting a 1.0 payload does not enable this workaround.
+flag; accepting a 1.0 payload does not enable either workaround.
 Requests that do not allow host loopback use the PSEC 1.0 capability mapping.
 Requests the PSEC contract cannot preserve continue to an AppContainer tier.
 
