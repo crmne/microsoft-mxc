@@ -60,6 +60,98 @@ use crate::wslc_common::wslc_bindings::*;
 /// whose VHDX another live session already has mounted.
 const E_SHARING_VIOLATION: HRESULT = 0x8007_0020_u32 as HRESULT;
 
+/// VM/session boot budget, in milliseconds.
+///
+/// Deliberately independent of any per-command runtime deadline, so a short
+/// command timeout cannot abort a cold VM boot.
+pub const SESSION_BOOT_TIMEOUT_MS: u32 = 180_000;
+
+/// How a session's WSL2 utility VM is sized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionSizing {
+    /// Virtual CPUs, or `None` for the host default.
+    pub cpu_count: Option<u32>,
+
+    /// Memory in MB, or `None` for the host default.
+    pub memory_mb: Option<u64>,
+
+    /// Whether to enable GPU passthrough.
+    pub gpu: bool,
+}
+
+/// What the host has installed, rather than what is currently free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCapacity {
+    /// Physical memory installed, in MB.
+    pub total_memory_mb: u64,
+
+    /// Logical processors the machine has.
+    pub logical_cpus: u32,
+}
+
+/// Read what this host has installed.
+fn host_capacity() -> Option<HostCapacity> {
+    use windows::Win32::System::SystemInformation::{
+        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+    };
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+
+    // SAFETY: `status` is a valid `MEMORYSTATUSEX` whose `dwLength` is set, as
+    // the API requires.
+    unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
+
+    let mut info = SYSTEM_INFO::default();
+
+    // SAFETY: `info` is a valid, writable `SYSTEM_INFO`.
+    unsafe { GetSystemInfo(&mut info) };
+
+    // A job object narrowing what mxc may run on does not narrow what the
+    // hypervisor can give a VM, so this counts the machine's processors rather
+    // than the ones this process may use.
+    Some(HostCapacity {
+        total_memory_mb: status.ullTotalPhys / (1024 * 1024),
+        logical_cpus: info.dwNumberOfProcessors,
+    })
+}
+
+/// Reject a session asking for more processors than the host has.
+///
+/// `memory_mb` is deliberately not checked: it is a ceiling the host backs on
+/// demand, so asking for more memory than is installed works.
+fn sizing_fits_host(sizing: SessionSizing, host: HostCapacity) -> Result<(), ScriptResponse> {
+    // The SDK reads `0` as "use the default" rather than as a size.
+    let Some(cpu_count) = sizing.cpu_count.filter(|cpus| *cpus > 0) else {
+        return Ok(());
+    };
+
+    if cpu_count > host.logical_cpus {
+        return Err(WslcError::Rejected(format!(
+            "cpu_count {cpu_count} exceeds the {} logical processors this host has; \
+             WSLc does not oversubscribe processors, though memory_mb may exceed \
+             installed memory because it is a ceiling rather than a reservation",
+            host.logical_cpus
+        ))
+        .into_response());
+    }
+
+    Ok(())
+}
+
+/// Reject a session sized past this host, when the host can be measured.
+///
+/// A host that cannot be measured is allowed through, since refusing real work
+/// over a failed diagnostic call would be the worse failure.
+pub fn check_sizing_against_host(sizing: SessionSizing) -> Result<(), ScriptResponse> {
+    match host_capacity() {
+        Some(host) => sizing_fits_host(sizing, host),
+        None => Ok(()),
+    }
+}
+
 /// Build a `ScriptResponse` error from an HRESULT failure with an optional
 /// SDK-provided message. Thin wrapper over [`WslcError::Sdk`], which owns the
 /// message formatting and the `LaunchFailed` phase attribution.
@@ -701,9 +793,7 @@ pub unsafe fn load_sdk_checked(logger: &mut Logger) -> Result<WslcSdk, ScriptRes
     Ok(sdk)
 }
 
-/// Create the shared daemon session (the WSL2 utility VM). Minimal by design —
-/// no per-request cpu/memory/timeout/gpu tuning (those are one-shot `WslcConfig`
-/// knobs; the daemon amortises a single session across sandboxes).
+/// Create the shared daemon session (the WSL2 utility VM).
 ///
 /// # Safety
 /// `sdk` must hold valid function pointers and COM must be initialised on this
@@ -712,6 +802,7 @@ pub unsafe fn create_daemon_session(
     sdk: &WslcSdk,
     session_name: &str,
     storage_path: &str,
+    sizing: SessionSizing,
     logger: &mut Logger,
 ) -> Result<WslcSessionGuard, ScriptResponse> {
     // Both wide buffers must outlive `WslcCreateSession` (the SDK stores pointers
@@ -725,10 +816,13 @@ pub unsafe fn create_daemon_session(
     if hr != S_OK {
         return Err(sdk_error("WslcInitSessionSettings failed", hr, ""));
     }
+    apply_session_sizing(sdk, &mut settings, sizing)?;
 
     let mut session: WslcSession = ptr::null_mut();
     let mut err_msg = CoTaskMemPWSTR::null();
+    let started = Instant::now();
     let hr = sdk.WslcCreateSession(&mut settings, &mut session, err_msg.as_mut_ptr());
+    let created_in = started.elapsed();
     if hr != S_OK {
         let msg = err_msg.to_string_lossy();
         return Err(sdk_error("WslcCreateSession failed", hr, &msg));
@@ -739,14 +833,109 @@ pub unsafe fn create_daemon_session(
         sdk.terminate_session_fn(),
         sdk.release_session_fn(),
     );
-    validate_store_access(sdk, guard.as_raw(), storage_path)?;
 
+    // Timed separately from the create: a host that cannot supply the session
+    // accepts it here in under a second and spends minutes failing in the
+    // probe, so one figure would hide where the time went.
+    let probed = Instant::now();
+    let probe = validate_store_access(sdk, guard.as_raw(), storage_path);
+    let probed_in = probed.elapsed();
+
+    // Logged before the probe is allowed to fail, because the failing case is
+    // the one whose timing matters.
     let _ = writeln!(
         logger,
-        "[WSLC][daemon] Session created on store {storage_path}"
+        "[WSLC][daemon] Session '{session_name}' on store {storage_path}: create \
+         {:.1}s, store probe {:.1}s, probe {}",
+        created_in.as_secs_f32(),
+        probed_in.as_secs_f32(),
+        if probe.is_ok() { "ok" } else { "failed" }
     );
+    probe?;
 
     Ok(guard)
+}
+
+/// Apply a session's sizing and its boot deadline to `settings`.
+///
+/// The boot timeout is applied even when the caller asked for no sizing, since
+/// `WslcCreateSession` is otherwise unbounded.
+///
+/// # Safety
+/// `sdk` must hold valid function pointers and `settings` must be initialised.
+unsafe fn apply_session_sizing(
+    sdk: &WslcSdk,
+    settings: &mut WslcSessionSettings,
+    sizing: SessionSizing,
+) -> Result<(), ScriptResponse> {
+    check_sizing_against_host(sizing)?;
+
+    if let Some(cpu) = sizing.cpu_count {
+        let hr = sdk.WslcSetSessionSettingsCpuCount(settings, cpu);
+        if hr != S_OK {
+            return Err(sdk_error("WslcSetSessionSettingsCpuCount failed", hr, ""));
+        }
+    }
+
+    if let Some(memory_mb) = sizing.memory_mb {
+        let memory_mb = u32::try_from(memory_mb).map_err(|_| {
+            WslcError::Rejected(format!(
+                "memory_mb {memory_mb} exceeds the {} MB the WSLc SDK accepts",
+                u32::MAX
+            ))
+            .into_response()
+        })?;
+        let hr = sdk.WslcSetSessionSettingsMemory(settings, memory_mb);
+        if hr != S_OK {
+            return Err(sdk_error("WslcSetSessionSettingsMemory failed", hr, ""));
+        }
+    }
+
+    let hr = sdk.WslcSetSessionSettingsTimeout(settings, SESSION_BOOT_TIMEOUT_MS);
+    if hr != S_OK {
+        return Err(sdk_error("WslcSetSessionSettingsTimeout failed", hr, ""));
+    }
+
+    if sizing.gpu {
+        let hr = sdk.WslcSetSessionSettingsFeatureFlags(
+            settings,
+            WslcSessionFeatureFlags::WSLC_SESSION_FEATURE_FLAG_ENABLE_GPU,
+        );
+        if hr != S_OK {
+            return Err(sdk_error(
+                "WslcSetSessionSettingsFeatureFlags failed",
+                hr,
+                "",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Terminate and release a session, reporting a terminate the SDK refused.
+///
+/// A session whose VM did not stop still holds its image store, so reporting
+/// success would hand back a store slot the next lease cannot open.
+pub fn release_daemon_session(
+    session: WslcSessionGuard,
+    session_name: &str,
+    logger: &mut Logger,
+) -> Result<(), ScriptResponse> {
+    let hr = session.release_checked();
+    if hr != S_OK {
+        return Err(sdk_error(
+            "WslcTerminateSession failed",
+            hr,
+            &format!(
+                "the WSL2 utility VM for session '{session_name}' may still be running, so its \
+                 image store cannot be reused yet"
+            ),
+        ));
+    }
+
+    let _ = writeln!(logger, "[WSLC][daemon] Session '{session_name}' released");
+    Ok(())
 }
 
 /// Confirm a session just created can reach the store it was given.
@@ -780,7 +969,8 @@ fn store_access_failure(hr: HRESULT, storage_path: &str) -> ScriptResponse {
             &format!(
                 "the image store at {storage_path} is already held by another live session. \
                  A running wxc-wslc-daemon.exe releases it after its idle timeout; a \
-                 create-and-run execution releases it when the run ends"
+                 create-and-run execution releases it when the run ends; a slot being \
+                 warmed by --setup-wslc releases it when the warm finishes"
             ),
         )
     } else {
@@ -1318,6 +1508,89 @@ mod tests {
     use super::*;
     use crate::mxc_common::models::FailurePhase;
 
+    /// A modest machine: 16 GB and 8 logical processors.
+    const TEST_HOST: HostCapacity = HostCapacity {
+        total_memory_mb: 16 * 1024,
+        logical_cpus: 8,
+    };
+
+    #[test]
+    fn a_processor_count_the_host_cannot_supply_is_refused() {
+        let refused = sizing_fits_host(
+            SessionSizing {
+                cpu_count: Some(TEST_HOST.logical_cpus + 1),
+                ..SessionSizing::default()
+            },
+            TEST_HOST,
+        )
+        .expect_err("more processors than the host has must be refused");
+
+        assert_eq!(refused.failure_phase, FailurePhase::Rejected);
+        assert!(
+            refused.error_message.contains('9') && refused.error_message.contains('8'),
+            "the refusal must name both what was asked and what the host has: {}",
+            refused.error_message
+        );
+    }
+
+    #[test]
+    fn a_processor_count_the_host_can_supply_is_allowed() {
+        for cpus in [1, TEST_HOST.logical_cpus] {
+            assert!(
+                sizing_fits_host(
+                    SessionSizing {
+                        cpu_count: Some(cpus),
+                        ..SessionSizing::default()
+                    },
+                    TEST_HOST,
+                )
+                .is_ok(),
+                "{cpus} processors is within the host's {}",
+                TEST_HOST.logical_cpus
+            );
+        }
+    }
+
+    /// `memory_mb` is a ceiling the host backs on demand, not a reservation,
+    /// so a request past installed memory is legitimate.
+    #[test]
+    fn memory_past_installed_is_allowed_because_it_is_a_ceiling() {
+        assert!(
+            sizing_fits_host(
+                SessionSizing {
+                    memory_mb: Some(TEST_HOST.total_memory_mb * 8),
+                    ..SessionSizing::default()
+                },
+                TEST_HOST,
+            )
+            .is_ok(),
+            "memory_mb is a ceiling the host backs on demand, not a reservation"
+        );
+    }
+
+    /// The SDK documents `0` as "reset to the default" for both figures, so it
+    /// is a sentinel rather than a size and must not be measured against the
+    /// host.
+    #[test]
+    fn zero_is_a_default_sentinel_rather_than_a_size() {
+        assert!(sizing_fits_host(
+            SessionSizing {
+                cpu_count: Some(0),
+                memory_mb: Some(0),
+                gpu: false,
+            },
+            TEST_HOST,
+        )
+        .is_ok());
+    }
+
+    /// A request that names no sizing takes the host defaults and has nothing
+    /// to check.
+    #[test]
+    fn absent_sizing_is_allowed() {
+        assert!(sizing_fits_host(SessionSizing::default(), TEST_HOST).is_ok());
+    }
+
     #[test]
     fn a_held_store_is_reported_as_held_rather_than_as_a_failed_call() {
         let resp = store_access_failure(E_SHARING_VIOLATION, r"C:\slots\slot-0");
@@ -1330,6 +1603,11 @@ mod tests {
         );
         assert!(resp.error_message.contains(r"C:\slots\slot-0"));
         assert!(resp.error_message.contains("idle timeout"));
+        assert!(
+            resp.error_message.contains("--setup-wslc"),
+            "warming holds a slot's store too, and that holder clears on its own: {}",
+            resp.error_message
+        );
         assert!(resp.error_message.contains("80070020"));
     }
 

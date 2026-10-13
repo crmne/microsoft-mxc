@@ -42,8 +42,8 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use mxc_sdk::wslc_common::container_steps::OutStream;
 use mxc_sdk::wslc_common::daemon_protocol::{
-    encode_frame, DaemonRequest, DaemonResponse, DeprovisionConfig, ExecTerminal, StreamFrame,
-    MAX_EXEC_ID_BYTES, MAX_FRAME_SIZE,
+    encode_frame, DaemonRequest, DaemonResponse, DeprovisionConfig, DeprovisionSessionConfig,
+    ExecTerminal, StreamFrame, MAX_EXEC_ID_BYTES, MAX_FRAME_SIZE,
 };
 
 use crate::session_manager::{ExecSlotGuard, ExecStream, SessionHandle, WorkerError};
@@ -462,13 +462,47 @@ async fn release_undelivered_sandbox(session: &SessionHandle, sandbox_id: &str) 
     }
 }
 
-/// Write a provision reply, releasing the sandbox if the reply did not land.
+/// Deprovision a session whose `SessionProvisioned` reply could not be
+/// delivered.
 ///
-/// An id that never reaches its caller names a container nobody can
-/// deprovision, and its entry holds the idle watchdog's count above zero.
+/// The id exists only here, so giving up leaks a WSL2 utility VM and the store
+/// slot it holds.
+async fn release_undelivered_session(session: &SessionHandle, session_id: &str) {
+    for attempt in 1..=UNDELIVERED_RELEASE_ATTEMPTS {
+        let config = DeprovisionSessionConfig {
+            session_id: session_id.to_string(),
+        };
+        match session.deprovision_session(config).await {
+            Ok(()) => {
+                eprintln!(
+                    "[wslc-daemon] released session {session_id}: its reply never \
+                     reached the client"
+                );
+                return;
+            }
+            Err(e) if attempt == UNDELIVERED_RELEASE_ATTEMPTS => {
+                eprintln!(
+                    "[wslc-daemon] could not release session {session_id} after \
+                     {UNDELIVERED_RELEASE_ATTEMPTS} attempts: {e}. Nothing is using it, so the \
+                     daemon releases it once the empty-session grace elapses."
+                );
+            }
+            Err(e) => {
+                eprintln!("[wslc-daemon] release of session {session_id} failed ({e}); retrying");
+                tokio::time::sleep(UNDELIVERED_RELEASE_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// Write a reply that mints an id, releasing what it names if the reply did not
+/// land.
+///
+/// An id that never reaches its caller names a container or session nobody can
+/// release, and both hold the daemon open.
 ///
 /// `release` is a parameter so this path can be tested without a live session.
-async fn deliver_provision_reply<S, F, Fut>(
+async fn deliver_minted_reply<S, F, Fut>(
     pipe: &mut S,
     resp: &DaemonResponse,
     release: F,
@@ -479,8 +513,12 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let delivered = write_frame(pipe, resp).await;
-    if let (Err(_), DaemonResponse::Provisioned { sandbox_id }) = (&delivered, resp) {
-        release(sandbox_id.clone()).await;
+    if delivered.is_err() {
+        match resp {
+            DaemonResponse::Provisioned { sandbox_id } => release(sandbox_id.clone()).await,
+            DaemonResponse::SessionProvisioned { session_id } => release(session_id.clone()).await,
+            _ => {}
+        }
     }
     delivered
 }
@@ -525,12 +563,27 @@ where
         DaemonRequest::Ping => {
             write_frame(&mut pipe, &DaemonResponse::Pong).await?;
         }
+        DaemonRequest::ProvisionSession(config) => {
+            let resp = match session.provision_session(config).await {
+                Ok(session_id) => DaemonResponse::SessionProvisioned { session_id },
+                Err(e) => worker_err_response(e),
+            };
+            deliver_minted_reply(&mut pipe, &resp, |session_id| {
+                let session = &session;
+                async move { release_undelivered_session(session, &session_id).await }
+            })
+            .await?;
+        }
+        DaemonRequest::DeprovisionSession(config) => {
+            let resp = ok_or_err(session.deprovision_session(config).await);
+            write_frame(&mut pipe, &resp).await?;
+        }
         DaemonRequest::Provision(config) => {
             let resp = match session.provision(config).await {
                 Ok(sandbox_id) => DaemonResponse::Provisioned { sandbox_id },
                 Err(e) => worker_err_response(e),
             };
-            deliver_provision_reply(&mut pipe, &resp, |sandbox_id| {
+            deliver_minted_reply(&mut pipe, &resp, |sandbox_id| {
                 let session = &session;
                 async move { release_undelivered_sandbox(session, &sandbox_id).await }
             })
@@ -1331,7 +1384,7 @@ mod tests {
             sandbox_id: "wslc:abc".to_string(),
         };
 
-        let outcome = deliver_provision_reply(&mut BrokenPipe, &resp, |id| {
+        let outcome = deliver_minted_reply(&mut BrokenPipe, &resp, |id| {
             released.borrow_mut().push(id);
             std::future::ready(())
         })
@@ -1349,7 +1402,7 @@ mod tests {
             message: "provision failed".to_string(),
         };
 
-        let outcome = deliver_provision_reply(&mut BrokenPipe, &resp, |id| {
+        let outcome = deliver_minted_reply(&mut BrokenPipe, &resp, |id| {
             released.borrow_mut().push(id);
             std::future::ready(())
         })
@@ -1370,7 +1423,7 @@ mod tests {
         };
         let (mut client, mut server) = duplex(64 * 1024);
 
-        let outcome = deliver_provision_reply(&mut server, &resp, |id| {
+        let outcome = deliver_minted_reply(&mut server, &resp, |id| {
             released.borrow_mut().push(id);
             std::future::ready(())
         })
@@ -1401,6 +1454,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
+                session_id: None,
             }),
         )
         .await

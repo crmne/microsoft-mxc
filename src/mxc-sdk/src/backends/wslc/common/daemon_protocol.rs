@@ -50,7 +50,10 @@ pub const MAX_EXEC_ID_BYTES: usize = 128;
 /// A new optional field counts: these structs do not deny unknown fields, so a
 /// daemon predating one drops it and acts on a request it only partly
 /// understood.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// Changing this strands whatever a running daemon is holding, since the SDK
+/// offers no way to re-attach to a live session from another process.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 fn deserialize_exec_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -108,8 +111,32 @@ pub struct PortMapping {
     pub container_port: u16,
 }
 
-/// Inputs to `provision`: ensure the shared session (booting the WSL2 utility VM
-/// on first provision), resolve the image, and create the container. Mirrors the
+/// Inputs to `provision_session`: size and boot one WSL2 utility VM, so later
+/// `provision` requests can place containers in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProvisionSessionConfig {
+    /// Virtual CPUs, or absent for the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+
+    /// Memory in MB, or absent for the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+
+    /// Whether to enable GPU passthrough.
+    #[serde(default)]
+    pub gpu: bool,
+}
+
+/// Inputs to `deprovision_session`: release one session and the utility VM
+/// behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeprovisionSessionConfig {
+    pub session_id: String,
+}
+
+/// Inputs to `provision`: ensure the session (booting the WSL2 utility VM on
+/// first provision), resolve the image, and create the container. Mirrors the
 /// session/container-level fields of the one-shot `WslcConfig` plus the
 /// container's volume and network policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +155,14 @@ pub struct ProvisionConfig {
     /// Host → container TCP forwards for this sandbox's container.
     #[serde(default)]
     pub port_mappings: Vec<PortMapping>,
+
+    /// Which session to place this container in, from an earlier
+    /// [`DaemonResponse::SessionProvisioned`].
+    ///
+    /// Absent joins the daemon's implicit session, shared by every request that
+    /// names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Inputs to `start`: the container was created at provision; start boots it.
@@ -210,6 +245,12 @@ pub enum ExecTerminal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    /// Boot a sized session. Replies [`DaemonResponse::SessionProvisioned`].
+    ProvisionSession(ProvisionSessionConfig),
+
+    /// Release a session and the utility VM behind it. Replies
+    /// [`DaemonResponse::Ok`].
+    DeprovisionSession(DeprovisionSessionConfig),
     /// Ensure session + create container. Replies [`DaemonResponse::Provisioned`].
     Provision(ProvisionConfig),
     /// Boot the created container. Replies [`DaemonResponse::Ok`].
@@ -231,6 +272,9 @@ pub enum DaemonRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    /// `provision_session` succeeded; carries the minted session id, which a
+    /// later `provision` presents to place a container in that session.
+    SessionProvisioned { session_id: String },
     /// `provision` succeeded; carries the minted sandbox id (the addressable
     /// handle a later phase presents).
     Provisioned { sandbox_id: String },
@@ -436,6 +480,7 @@ mod tests {
                 windows_port: 8080,
                 container_port: 80,
             }],
+            session_id: Some("wslcsess:abc".to_string()),
         }));
     }
 
@@ -464,6 +509,16 @@ mod tests {
         roundtrip(DaemonRequest::Deprovision(DeprovisionConfig {
             sandbox_id: "wslc:abc123".to_string(),
         }));
+        roundtrip(DaemonRequest::ProvisionSession(ProvisionSessionConfig {
+            cpu_count: Some(4),
+            memory_mb: Some(8192),
+            gpu: true,
+        }));
+        roundtrip(DaemonRequest::DeprovisionSession(
+            DeprovisionSessionConfig {
+                session_id: "wslcsess:abc123".to_string(),
+            },
+        ));
         roundtrip(DaemonRequest::Ping);
     }
 
@@ -501,6 +556,9 @@ mod tests {
 
     #[test]
     fn roundtrip_each_response_variant() {
+        roundtrip(DaemonResponse::SessionProvisioned {
+            session_id: "wslcsess:abc123".to_string(),
+        });
         roundtrip(DaemonResponse::Provisioned {
             sandbox_id: "wslc:abc123".to_string(),
         });
@@ -522,6 +580,54 @@ mod tests {
                 message: "detail".to_string(),
             });
         }
+    }
+
+    #[test]
+    fn a_provision_without_a_session_joins_the_implicit_one() {
+        // Every caller predating addressable sessions omits this field, and
+        // must keep getting the daemon's shared session rather than a decode
+        // failure.
+        let wire = r#"{"op":"provision","image":"alpine:latest"}"#;
+        let decoded: DaemonRequest = serde_json::from_str(wire).expect("decode without a session");
+
+        let DaemonRequest::Provision(config) = decoded else {
+            panic!("expected a provision request");
+        };
+        assert_eq!(config.session_id, None);
+    }
+
+    #[test]
+    fn an_absent_session_is_left_off_the_wire() {
+        let frame = serde_json::to_string(&ProvisionConfig {
+            image: "alpine:latest".to_string(),
+            image_tar_path: None,
+            volumes: Vec::new(),
+            network: NetworkMode::None,
+            port_mappings: Vec::new(),
+            session_id: None,
+        })
+        .expect("serialize");
+
+        assert!(
+            !frame.contains("session_id"),
+            "an absent session must not serialize as a present null: {frame}"
+        );
+    }
+
+    #[test]
+    fn a_session_sizing_omitted_is_the_host_default() {
+        let wire = r#"{"op":"provision_session"}"#;
+        let decoded: DaemonRequest = serde_json::from_str(wire).expect("decode bare sizing");
+
+        assert_eq!(
+            decoded,
+            DaemonRequest::ProvisionSession(ProvisionSessionConfig {
+                cpu_count: None,
+                memory_mb: None,
+                gpu: false,
+            }),
+            "absent sizing is the host default, which is distinct from a zero"
+        );
     }
 
     #[test]
