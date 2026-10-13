@@ -444,13 +444,20 @@ for (const member of rustCapabilityMembers) {
   }
 }
 
-const tierMatch = /const CANONICAL_TIERS:[^=]+=\s*\[([^\]]+)\]/s.exec(
-  rustProbeFull
+const rustTierLadder = read(
+  "src",
+  "mxc-sdk",
+  "src",
+  "backends",
+  "process_container",
+  "common",
+  "fallback_detector.rs"
 );
+const tierMatch = /isolation_tiers!\s*\{(.*?)\n\}/s.exec(rustTierLadder);
 if (!tierMatch) {
-  errors.push("probe.rs: could not find CANONICAL_TIERS");
+  errors.push("fallback_detector.rs: could not find the isolation_tiers! ladder");
 } else {
-  const rustTiers = [...tierMatch[1].matchAll(/"([^"]+)"/g)].map(
+  const rustTiers = [...tierMatch[1].matchAll(/=>\s*"([^"]+)"/g)].map(
     (match) => match[1]
   );
   const managedTiers = [

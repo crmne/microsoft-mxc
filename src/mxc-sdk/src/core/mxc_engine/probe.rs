@@ -296,6 +296,54 @@ mod tests {
         IsolationTier::ALL.iter().map(|t| t.as_str()).collect()
     }
 
+    /// The host detector [`available_backends`] calls for each backend, or
+    /// `None` when it has none. Exhaustive on purpose: a new backend cannot
+    /// compile without naming its detector here, and
+    /// `probe_coverage_matches_the_host_detector_mapping` holds it to the
+    /// `ProbeCoverage` the registry declares.
+    fn host_detector(backend: &ContainmentBackend) -> Option<&'static str> {
+        match backend {
+            ContainmentBackend::ProcessContainer => Some("always reported on Windows"),
+            ContainmentBackend::Wslc => Some("wslc_common::is_available"),
+            ContainmentBackend::Lxc => Some("lxc_common::availability::is_lxc_available"),
+            ContainmentBackend::Vm => None,
+            ContainmentBackend::MicroVm => None,
+            ContainmentBackend::Hyperlight => Some("hyperlight_common::is_whp_available"),
+            ContainmentBackend::WindowsSandbox => {
+                Some("windows_sandbox_lifecycle::availability::is_windows_sandbox_available")
+            }
+            ContainmentBackend::IsolationSession => {
+                Some("isolation_session_common::availability::is_isolation_session_available")
+            }
+            ContainmentBackend::Seatbelt => Some("/usr/bin/sandbox-exec presence"),
+            ContainmentBackend::Bubblewrap => Some("bwrap_common::bwrap_version::probe_bwrap"),
+        }
+    }
+
+    /// Ties the registry's declaration to real detection: a backend registered
+    /// as `Detected` must name a detector, and one registered as `NotDetected`
+    /// must not have one.
+    #[test]
+    fn probe_coverage_matches_the_host_detector_mapping() {
+        for entry in backend_registry::all() {
+            let detector = host_detector(&entry.backend);
+            match &entry.probe_coverage {
+                ProbeCoverage::Detected => assert!(
+                    detector.is_some(),
+                    "{:?} is registered as Detected but available_backends() has no detector \
+                     for it",
+                    entry.backend
+                ),
+                ProbeCoverage::NotDetected(reason) => assert!(
+                    detector.is_none(),
+                    "{:?} is registered as NotDetected ({reason}) but names the detector {:?}",
+                    entry.backend,
+                    detector
+                ),
+            }
+        }
+    }
+
     #[test]
     fn tier_is_omitted_from_json_when_none() {
         let backend = AvailableBackend::tierless("seatbelt");

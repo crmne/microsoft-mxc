@@ -171,7 +171,8 @@ the backend itself still appears either way. Both directions are covered by exer
 test host happens to have `slirp4netns` installed.
 - A serde snapshot pins the camelCase capability name (`"proxyEnforcement"`) and verifies that
 `capabilities` and `warnings` are **omitted** when empty.
-- `wslc` appears when `WslcSdk::load()` resolves `wslcsdk.dll`. Each backend declares a
+- `wslc` appears when `wslc_common::is_available()` confirms WSL2 and the WSLC runtime are present;
+resolving `wslcsdk.dll` alone is not sufficient. Each backend declares a
 `ProbeCoverage` in `mxc_engine::backend_registry`, and a test asserts that one registered as
 `NotDetected` never appears in the output.
 - The TypeScript `getPlatformSupport()` output matches the native probe (parity by projection, §4.2),
