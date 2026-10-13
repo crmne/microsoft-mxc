@@ -286,36 +286,15 @@ fn select_tier(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mxc_common::models::ContainmentBackend;
+    use crate::mxc_engine::backend_registry::{self, ProbeCoverage};
 
-    const CANONICAL_BACKEND_NAMES: &[(ContainmentBackend, &str)] = &[
-        (ContainmentBackend::ProcessContainer, "processcontainer"),
-        (ContainmentBackend::Wslc, "wslc"),
-        (ContainmentBackend::Lxc, "lxc"),
-        (ContainmentBackend::Vm, "vm"),
-        (ContainmentBackend::MicroVm, "microvm"),
-        (ContainmentBackend::Hyperlight, "hyperlight"),
-        (ContainmentBackend::WindowsSandbox, "windows_sandbox"),
-        (ContainmentBackend::IsolationSession, "isolation_session"),
-        (ContainmentBackend::Seatbelt, "seatbelt"),
-        (ContainmentBackend::Bubblewrap, "bubblewrap"),
-    ];
-
-    fn all_containment_names() -> Vec<String> {
-        CANONICAL_BACKEND_NAMES
-            .iter()
-            .map(|(_, name)| (*name).to_string())
-            .collect()
+    /// Every tier the process-container ladder can name, derived from
+    /// [`IsolationTier`] so a new rung cannot be missed here.
+    #[cfg(target_os = "windows")]
+    fn canonical_tiers() -> Vec<&'static str> {
+        use crate::process_container_common::fallback_detector::IsolationTier;
+        IsolationTier::ALL.iter().map(|t| t.as_str()).collect()
     }
-
-    #[test]
-    fn backend_wire_names_match_the_canonical_table() {
-        for (backend, expected) in CANONICAL_BACKEND_NAMES {
-            assert_eq!(backend.wire_name(), *expected, "{backend:?}");
-        }
-    }
-
-    const CANONICAL_TIERS: [&str; 3] = ["base-container", "appcontainer-bfs", "appcontainer-dacl"];
 
     #[test]
     fn tier_is_omitted_from_json_when_none() {
@@ -420,7 +399,7 @@ mod tests {
 
     #[test]
     fn every_reported_backend_uses_a_canonical_name() {
-        let known = all_containment_names();
+        let known = backend_registry::all_containment_names();
         for entry in available_backends() {
             assert!(
                 known.contains(&entry.backend),
@@ -430,26 +409,74 @@ mod tests {
         }
     }
 
+    /// A backend registered as having no host detector must not surface here;
+    /// the registration and the probe are two halves of one decision.
+    #[test]
+    fn backends_without_a_host_detector_are_never_reported() {
+        let reported: Vec<String> = available_backends()
+            .into_iter()
+            .map(|entry| entry.backend)
+            .collect();
+        for entry in backend_registry::all() {
+            if let ProbeCoverage::NotDetected(reason) = &entry.probe_coverage {
+                let name = entry.backend.wire_name();
+                assert!(
+                    !reported.contains(&name.to_string()),
+                    "{name} is reported by available_backends() but registered as undetected: \
+                     {reason}"
+                );
+            }
+        }
+    }
+
+    /// Only the Windows process container has a tier ladder, so a tier
+    /// appearing elsewhere means a new ladder landed without probe coverage.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn no_backend_reports_a_tier_off_windows() {
+        for entry in available_backends() {
+            assert_eq!(
+                entry.tier, None,
+                "{} reported a tier, but no non-Windows backend has a tier ladder",
+                entry.backend
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     #[test]
     fn every_reported_tier_is_a_canonical_tier_string() {
+        let canonical = canonical_tiers();
         for entry in available_backends() {
             if let Some(tier) = entry.tier {
                 assert!(
-                    CANONICAL_TIERS.contains(&tier.as_str()),
+                    canonical.contains(&tier.as_str()),
                     "reported tier {tier:?} is not a canonical IsolationTier string"
                 );
             }
         }
     }
 
-    /// Guards `CANONICAL_TIERS` against drift from `IsolationTier::as_str()`.
+    /// Fails when a tier is added to [`IsolationTier`] without a rung in
+    /// [`select_tier`], which would leave the probe unable to ever report it.
     #[cfg(target_os = "windows")]
     #[test]
-    fn canonical_tier_strings_match_isolation_tier() {
+    fn every_isolation_tier_is_reachable_from_select_tier() {
         use crate::process_container_common::fallback_detector::IsolationTier;
-        assert_eq!(IsolationTier::BaseContainer.as_str(), CANONICAL_TIERS[0]);
-        assert_eq!(IsolationTier::AppContainerBfs.as_str(), CANONICAL_TIERS[1]);
-        assert_eq!(IsolationTier::AppContainerDacl.as_str(), CANONICAL_TIERS[2]);
+        let reachable: Vec<IsolationTier> =
+            [(true, true), (true, false), (false, true), (false, false)]
+                .into_iter()
+                .map(|(base_container_usable, tier2_bfs_enabled)| {
+                    select_tier(base_container_usable, tier2_bfs_enabled)
+                })
+                .collect();
+        for tier in IsolationTier::ALL {
+            assert!(
+                reachable.contains(&tier),
+                "select_tier can never report {:?}; the probe tier ladder is missing a rung",
+                tier.as_str()
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -462,7 +489,7 @@ mod tests {
             .expect("processcontainer must always be reported on Windows");
         let tier = pc.tier.as_deref().expect("processcontainer carries a tier");
         assert!(
-            CANONICAL_TIERS.contains(&tier),
+            canonical_tiers().contains(&tier),
             "unexpected processcontainer tier: {tier:?}"
         );
     }

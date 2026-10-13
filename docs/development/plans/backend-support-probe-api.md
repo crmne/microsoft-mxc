@@ -160,7 +160,9 @@ See §7.9 for why the canonical probe stays in Rust rather than moving into the 
 (`{"backend":"…","tier":"…"}`) and verifies that `tier` is **omitted** when `None`
 (`#[serde(skip_serializing_if = "Option::is_none")]`), never serialized as `null`.
 - Every non-`None` `tier` is one of the canonical `IsolationTier::as_str()` strings,
-guarding against drift between this API and the tier ladder.
+guarding against drift between this API and the tier ladder. The canonical list is derived from
+`IsolationTier::ALL`, and a further test asserts every tier is reachable from `select_tier`, so a
+new tier cannot land without probe coverage.
 - On Linux, `bubblewrap` and `lxc` each appear when their check passes (`bwrap --version` / `lxc-ls --version`).
 - On Linux, `bubblewrap` carries the `proxyEnforcement` capability when the private-namespace
 dependencies are present, and a `warnings` entry naming the missing dependency when they are not;
@@ -169,8 +171,9 @@ the backend itself still appears either way. Both directions are covered by exer
 test host happens to have `slirp4netns` installed.
 - A serde snapshot pins the camelCase capability name (`"proxyEnforcement"`) and verifies that
 `capabilities` and `warnings` are **omitted** when empty.
-- `wslc` appears when `WslcSdk::load()` resolves `wslcsdk.dll`; the remaining VM group
-(`windows_sandbox`, `isolation_session`, `microvm`, `hyperlight`) never appears until its detector lands.
+- `wslc` appears when `WslcSdk::load()` resolves `wslcsdk.dll`. Each backend declares a
+`ProbeCoverage` in `mxc_engine::backend_registry`, and a test asserts that one registered as
+`NotDetected` never appears in the output.
 - The TypeScript `getPlatformSupport()` output matches the native probe (parity by projection, §4.2),
  guarding against the two layers drifting.
 
@@ -179,7 +182,8 @@ test host happens to have `slirp4netns` installed.
 Writing the missing detectors and wiring the TypeScript projection, one issue each:
 1. `windows_sandbox` - optional-feature (DISM/registry) detector.
 2. `isolation_session` - probe whether the `Windows.AI.IsolationSession.Preview` `IsoSessionOps` API class is registered on the OS (activation-factory resolvable), replacing the old build-number gate (see #761), and expose it to Rust.
-3. `microvm` / `hyperlight` - hypervisor-presence probe.
+3. `microvm` - hypervisor-presence probe. `hyperlight` has one (`is_whp_available()`); `microvm`
+is registered as `ProbeCoverage::NotDetected` until its detector lands.
 4. `lxc` - port the `lxc-ls` presence check from TypeScript to Rust,
 so the probe (not just the SDK) can report it (§4.2, step 1).
 5. TypeScript projection - make `getPlatformSupport()` read the native backend availability via a
