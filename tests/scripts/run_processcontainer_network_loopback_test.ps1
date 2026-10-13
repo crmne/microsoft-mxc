@@ -32,8 +32,8 @@ Initialize-WpcContext @PSBoundParameters
 # of getting this wrong are user-visible — an unreachable local dev server, or
 # a loopback hole — and only a live run distinguishes them.
 #
-# `hostLoopback: "allow"` is PSEC-1.1-only; every other path must reject it
-# rather than accept it with partial enforcement.
+# PSEC 1.0-only hosts may accept the allow-all direct-egress posture; other
+# unsupported policies must reject rather than run with partial enforcement.
 function Phase-NetworkHostLoopback {
     Section 'Phase 8d: host-loopback policy'
 
@@ -94,24 +94,28 @@ function Phase-NetworkHostLoopback {
         $allow = Invoke-NetRun -Name 'net-loopback-allow' -ConfigPath $cfgAllow
 
         if (Test-PsecEligible) {
-            # On a PSEC 1.1 host this must work. On a PSEC 1.0 host the
-            # documented behavior is rejection — so either outcome is
-            # defensible, but "accepted and silently unenforced" is not.
+            # PSEC 1.1 with ingress and PSEC 1.0-only with the compatible
+            # allow-all posture may succeed; unsupported hosts must reject.
             $accepted = ($allow.Verdict -eq 'REACHED')
             $rejected = Test-WasRejected $allow
             Record-Result -Phase 'P8d' -Name 'hostLoopback=allow is either enforced or rejected, never silently dropped' `
                 -Pass ($accepted -or $rejected) `
                 -Detail "verdict=$($allow.Verdict); exit=$($allow.Result.ExitCode); timedOut=$($allow.Result.TimedOut); accepted=$accepted rejected=$rejected"
+            if ($Script:Caps.BaseContainerSupportsIdentitylessLoopbackProxy -and
+                -not $Script:Caps.BaseContainerSupportsIngressHostLoopbackAllow) {
+                Record-Result -Phase 'P8d' -Name 'PSEC 1.0-only host accepts allow-all direct host loopback' `
+                    -Pass $accepted -Detail "verdict=$($allow.Verdict); exit=$($allow.Result.ExitCode)"
+            }
             if ($accepted) {
-                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow reaches the host loopback anchor (PSEC 1.1)' `
-                    -Pass $true -Detail 'bidirectional host-loopback grant honored'
+                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow reaches the host loopback anchor (PSEC)' `
+                    -Pass $true -Detail 'container-to-host loopback grant honored'
             } elseif ($rejected) {
-                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow rejected (PSEC 1.1 ingress contract unavailable)' `
-                    -Status 'skip' -Detail "exit=$($allow.Result.ExitCode); documented fallback when contract 1.1 is absent"
+                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow rejected (PSEC policy unsupported)' `
+                    -Status 'skip' -Detail "exit=$($allow.Result.ExitCode); host cannot enforce this request"
             } else {
                 # Neither enforced nor refused. Calling this a skip would name an
                 # outcome that did not happen.
-                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow reaches the host loopback anchor (PSEC 1.1)' `
+                Record-Result -Phase 'P8d' -Name 'hostLoopback=allow reaches the host loopback anchor (PSEC)' `
                     -Pass $false `
                     -Detail "verdict=$($allow.Verdict); exit=$($allow.Result.ExitCode); neither reached the anchor nor produced a typed rejection"
             }
@@ -128,4 +132,3 @@ function Phase-NetworkHostLoopback {
 
 Invoke-WpcPhase -Key 'NetworkHostLoopback' -Body { Phase-NetworkHostLoopback }
 Complete-WpcChild
-

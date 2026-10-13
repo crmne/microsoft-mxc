@@ -2,7 +2,7 @@
 
 > **Audience:** MXC developers
 >
-> **Status:** Investigation; restoration is conditional on Windows host validation.
+> **Status:** Minimal compatibility candidate implemented; Windows host validation pending.
 
 ## Reported behavior
 
@@ -51,6 +51,11 @@ the fence marker; it is restored here for readable JSON.
   [ProcessContainer networking guide](../../backends/process-container/networking.md)
   also documents an unresolved host-to-container limitation for proxy mode;
   switching to a proxy is not an equivalent restoration of direct egress.
+* This branch adds a candidate PSEC 1.0-only compatibility path for the
+  allow-all direct-egress posture above, without a proxy, proxy peer, or
+  egress rules. It selects the 1.0 payload and restores `networkLoopback`
+  alongside the existing `MXC-Loopback` peer. It does not change the PSEC 1.1
+  ingress path or permit other direct-egress host-loopback policies on 1.0.
 
 For the current selection and serialization paths, see
 [`BaseContainerRunner::can_backend_service_request`](../../../src/mxc-sdk/src/backends/process_container/common/base_container_runner.rs),
@@ -76,8 +81,9 @@ bidirectional loopback connectivity.
    binaries and their request formats separate; do not attribute a request
    parsing failure to the runtime capability gate.
 2. Reproduce the original policy on that same host: check whether 0.8 actually
-   launches and connects in **both** directions, and whether tagged 1.0.0
-   rejects before launch with the expected unsupported-policy outcome. Test
+   launches and connects in **both** directions, whether tagged 1.0.0
+   rejects before launch, and whether a build from this branch connects in
+   **both** directions with a PSEC 1.0 payload. Test
    explicit `hostLoopback: "deny"` and omitted host loopback as negative
    controls; a timeout or unrelated launch failure is not evidence of
    enforcement.
@@ -91,20 +97,17 @@ bidirectional loopback connectivity.
    [`run_processcontainer_network_loopback_test.ps1`](../../../tests/scripts/run_processcontainer_network_loopback_test.ps1)
    can be run with `-RequireTier base-container` as documented in
    [`tests/scripts/README.md`](../../../tests/scripts/README.md). On a PSEC 1.0
-   host, it accepts a clean rejection as success. It checks the
-   container-to-host loopback path; add or perform a separate host-to-container
-   check before claiming the bidirectional contract is met.
-5. If the old mapping proves sufficient, limit a compatibility change to
-   PSEC 1.0-only hosts and the direct-egress request shape actually verified.
-   Keep PSEC 1.1+ hosts without NetworkIngress, failed version/support
-   queries, unsupported policies, and AppContainer fallback fail-closed.
-   Include host-level positive and negative regression tests and document
-   the distinct proxy behavior. Otherwise retain rejection and clarify the
-   host requirement and migration guidance.
+   host, it requires a successful fetch when the host probe identifies
+   PSEC 1.0-only proxy compatibility. It checks the container-to-host
+   loopback path; add or perform a separate host-to-container check before
+   claiming the bidirectional contract is met.
+5. Verify that a build from this branch still rejects other direct-egress
+   host-loopback postures on PSEC 1.0-only hosts and rejects all such requests
+   on PSEC 1.1+ hosts without NetworkIngress. Failed version/support queries
+   and AppContainer fallback must remain fail-closed. If the old mapping
+   cannot enforce the complete policy, do not ship this compatibility path.
 
-**Recommendation:** Investigate a narrowly gated restoration because the
-same-machine compatibility loss is real, but do not relax the gate based only
-on 0.8 connectivity. Tagged 1.0.0 is already published; if full enforcement
-is verified, ship the fix in a subsequent 1.0.x release rather than changing
-the released artifact. No VM validation or restoration is claimed by this
-note.
+**Recommendation:** Treat this implementation as a candidate for VM validation,
+not evidence of enforcement on the affected host. Tagged 1.0.0 is already
+published; if full enforcement is verified, ship a subsequent 1.0.x release
+rather than changing the released artifact. No VM validation is claimed here.

@@ -354,6 +354,9 @@ function Get-HostCapabilities {
     $identitylessProxyBit = if ($p.probes.PSObject.Properties['baseContainerSupportsIdentitylessLoopbackProxy']) {
         [bool]$p.probes.baseContainerSupportsIdentitylessLoopbackProxy
     } else { $false }
+    $ingressLoopbackBit = if ($p.probes.PSObject.Properties['baseContainerSupportsIngressHostLoopbackAllow']) {
+        [bool]$p.probes.baseContainerSupportsIngressHostLoopbackAllow
+    } else { $false }
     # uiCapabilities is absent on older binaries / when the detector errored.
     $canInject = $false
     if ($p.probes.PSObject.Properties['uiCapabilities'] -and
@@ -391,6 +394,7 @@ function Get-HostCapabilities {
         SupportsDeniedPaths            = (($tier -eq 'appcontainer-dacl') -or $denyBit)
         BaseContainerSupportsEnumeratePaths = $enumBit
         BaseContainerSupportsIdentitylessLoopbackProxy = $identitylessProxyBit
+        BaseContainerSupportsIngressHostLoopbackAllow = $ingressLoopbackBit
         # enumeratePaths has NO fallback: it needs PSEC 1.1 plus
         # PSE_SUPPORT_FS_ENUMERATE, and the detector refuses the request
         # outright on every AppContainer tier (FallbackError::

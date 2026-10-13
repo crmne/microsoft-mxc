@@ -16,7 +16,9 @@ use crate::mxc_common::state_aware_request::MxcRequest;
 use crate::process_security_environment_spec::process_security_environment_layout as psec_layout;
 use serde_json::json;
 
-use super::{build_psec_v1_security_environment_spec, LOOPBACK_NETWORK_PEER};
+use super::{
+    build_psec_v1_security_environment_spec, psec_1_0_direct_loopback_policy, LOOPBACK_NETWORK_PEER,
+};
 use crate::process_container_common::base_container_runner::BaseContainerRunner;
 use crate::process_container_common::network_policy_helpers::PRIVATE_NETWORK_CAPABILITY;
 use crate::process_container_common::secenv::{
@@ -47,6 +49,30 @@ fn runtime_proxy_request(proxy: &TcpListener) -> ExecutionRequest {
         panic!("expected a one-shot request");
     };
     request
+}
+
+#[test]
+fn psec_1_0_direct_loopback_accepts_issue_1485_v1_policy_shape() {
+    let config = json!({
+        "version": "1.0.0",
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": "cmd.exe /d /c echo loopback-launched",
+            "timeout": 30000,
+        },
+        "network": {
+            "egress": { "default": "allow" },
+            "ingress": { "default": "allow", "hostLoopback": "allow" },
+        },
+    });
+    let mut logger = Logger::new(Mode::Buffer);
+    let MxcRequest::OneShot(request) =
+        load_mxc_request_from_json(&config.to_string(), &mut logger).unwrap()
+    else {
+        panic!("expected a one-shot request");
+    };
+
+    assert!(psec_1_0_direct_loopback_policy(&request));
 }
 
 #[test]
