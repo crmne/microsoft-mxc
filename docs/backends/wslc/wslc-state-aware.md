@@ -237,6 +237,7 @@ grace**, which defaults to the daemon's own idle window.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `MXC_WSLC_DAEMON_SESSION_IDLE_SECS` | `MXC_WSLC_DAEMON_IDLE_TIMEOUT_SECS`, else `300` | How long a session holding nothing is kept. |
+| `MXC_WSLC_DAEMON_SESSION_BOOT_SECS` | `600` | How long a boot is given before the clients waiting on it are let go. |
 
 Defaulting to the daemon's idle window is deliberate. That window is already the
 longest a caller can leave anything here untouched and expect to find it, since
@@ -352,10 +353,34 @@ from a previous build still inside its idle window — fails the provision with 
 error naming the slot, rather than relocating the session onto a cold slot and
 reporting a missing image instead.
 
-A session whose handles teardown had to abandon — because a pull was still
-running when the drain budget expired — keeps its slot leased rather than
-returning it. The abandoned session still has the store's VHDX mounted, so
-reissuing the slot would hand out a store nothing can open.
+A session whose VM teardown could not stop keeps its slot leased rather than
+returning it, because that VM may still have the store's VHDX mounted and
+reissuing the slot would hand out a store nothing can open. Three cases reach
+that state: a pull still running when the drain budget expired, a terminate that
+reported a failure, and a session teardown ran out of budget to terminate at all.
+
+Teardown spends its budget twice over: once waiting for in-flight work across
+every session, and again terminating the VMs that drained. Sharing one budget
+would let a single stuck pull leave the remaining sessions no time to release,
+and a leaked slot costs capacity permanently where a slow terminate does not.
+
+A session whose boot lands after teardown has begun is released before the SDK
+unloads rather than left for the command channel to drop.
+
+Stopping a VM runs on a thread of its own, as booting one does, so neither the
+empty-session reaper nor a `deprovision-session` holds up the sandboxes in every
+other session. Shutdown is the exception: it terminates on the spot, because its
+whole job is to finish before the SDK unloads. A client asking to release a
+session is answered when its VM has actually stopped, not when the request was
+accepted.
+
+The boot timeout above bounds `WslcCreateSession` only — the store probe that
+follows it has no deadline of its own and has been measured taking minutes. A
+boot still running after `MXC_WSLC_DAEMON_SESSION_BOOT_SECS` therefore has its
+waiting clients answered and its id retired, so a later request boots a fresh
+session rather than parking behind one that may never arrive. Its store slot
+stays held, because that boot thread may still open the store; if it does
+eventually produce a VM, that VM is released rather than installed.
 
 ### exec output semantics
 

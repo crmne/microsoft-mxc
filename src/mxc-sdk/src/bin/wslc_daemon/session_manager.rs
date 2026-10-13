@@ -78,6 +78,25 @@ fn session_name(session_id: &str) -> String {
     format!("{SESSION_NAME_PREFIX}-{suffix}")
 }
 
+/// Environment override for how long a session may take to boot, in whole
+/// seconds.
+const SESSION_BOOT_DEADLINE_ENV: &str = "MXC_WSLC_DAEMON_SESSION_BOOT_SECS";
+
+/// How long a boot is given before the clients waiting on it are let go.
+///
+/// The SDK's boot timeout bounds `WslcCreateSession` only and the store probe
+/// after it can run for minutes, so this bounds the wait rather than the call.
+fn session_boot_deadline() -> Duration {
+    crate::resolve_duration(
+        std::env::var(SESSION_BOOT_DEADLINE_ENV).ok().as_deref(),
+        SESSION_BOOT_DEADLINE,
+    )
+}
+
+/// Comfortably past the SDK's own boot timeout, so this fires only when the
+/// store probe is the thing that hung.
+const SESSION_BOOT_DEADLINE: Duration = Duration::from_secs(600);
+
 /// Environment override for how long a session holding nothing is kept, in
 /// whole seconds.
 const SESSION_IDLE_TIMEOUT_ENV: &str = "MXC_WSLC_DAEMON_SESSION_IDLE_SECS";
@@ -975,6 +994,91 @@ fn start_session_boot(
     spawned.map(|_| ())
 }
 
+/// A session on its way to being terminated off the worker thread.
+struct SessionRelease {
+    /// Both taken by the thread that terminates the VM, so `Drop` below can
+    /// tell a release that ran from one that never started.
+    session: Option<WslcSessionGuard>,
+    store: Option<StoreSlotLease>,
+    name: String,
+}
+
+// SAFETY: as for `SessionJob`. The guard is moved, never shared, so only one
+// thread owns it at a time.
+unsafe impl Send for SessionRelease {}
+
+impl Drop for SessionRelease {
+    fn drop(&mut self) {
+        // Reached only when the release never ran, so nothing asked the VM to
+        // stop and it may still hold the store's VHDX open.
+        if let Some(store) = self.store.take() {
+            std::mem::forget(store);
+        }
+    }
+}
+
+/// Terminate a session's VM on a thread of its own.
+///
+/// Stopping a VM is not instant, and the worker thread is where every other
+/// sandbox's work is serialized.
+fn start_session_release(
+    job: SessionRelease,
+    session_id: String,
+    in_flight: &Arc<AtomicUsize>,
+    reply: Option<oneshot::Sender<Result<(), WorkerError>>>,
+) {
+    let counted = SessionCount::enter(in_flight);
+    let spawned = std::thread::Builder::new()
+        .name("wslc-session-release".to_string())
+        .spawn(move || {
+            let mut job = job;
+
+            // Released only after the slot has been decided, so a teardown that
+            // sees zero knows no thread is still holding one.
+            let _counted = counted;
+
+            let mut log = Logger::new(Mode::Console);
+            let outcome = match ComApartment::enter() {
+                Err(e) => Err(WorkerError::Backend(e)),
+                Ok(_apartment) => {
+                    let Some(session) = job.session.take() else {
+                        return;
+                    };
+                    let store = job.store.take();
+                    match container_steps::release_daemon_session(session, &job.name, &mut log) {
+                        Ok(()) => {
+                            drop(store);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            log.log_line(&format!(
+                                "session {session_id} did not stop; keeping its store slot \
+                                 held: {}",
+                                e.error_message
+                            ));
+
+                            // The VM may still hold the store's VHDX open, so
+                            // the slot must never be handed out again.
+                            if let Some(store) = store {
+                                std::mem::forget(store);
+                            }
+                            Err(sr_err(e))
+                        }
+                    }
+                }
+            };
+
+            if let Some(reply) = reply {
+                let _ = reply.send(outcome);
+            }
+        });
+
+    if let Err(e) = spawned {
+        // The job's `Drop` keeps the slot held, since nothing stopped the VM.
+        eprintln!("[wslc-daemon] could not start a release thread: {e}");
+    }
+}
+
 /// Where a request's session stands.
 #[derive(Debug)]
 enum SessionLookup {
@@ -1002,6 +1106,14 @@ struct PendingSession {
         ProvisionConfig,
         oneshot::Sender<Result<String, WorkerError>>,
     )>,
+
+    /// When the boot thread started, so a boot that never reports can be given
+    /// up on.
+    started: Instant,
+
+    /// Set once the clients waiting on this boot have been let go. The entry
+    /// stays so a late report can still release the VM it created.
+    abandoned: bool,
 }
 
 /// One session the daemon holds: a WSL2 utility VM, its image store, and what
@@ -1048,6 +1160,9 @@ struct Worker {
     /// Session boots that have not reported back, which hold the SDK while
     /// they run.
     sessions_in_flight: Arc<AtomicUsize>,
+
+    /// Session releases still terminating their VMs on their own threads.
+    releases_in_flight: Arc<AtomicUsize>,
     next_pull_token: u64,
     store_slots: StoreSlotPool,
 
@@ -1079,6 +1194,7 @@ impl Worker {
             exec_in_flight: HashMap::new(),
             execs_in_flight: Arc::new(AtomicUsize::new(0)),
             sessions_in_flight: Arc::new(AtomicUsize::new(0)),
+            releases_in_flight: Arc::new(AtomicUsize::new(0)),
             next_pull_token: 0,
             store_slots: StoreSlotPool::new(),
             pending_sessions: HashMap::new(),
@@ -1185,6 +1301,8 @@ impl Worker {
                 sizing,
                 reply: None,
                 parked: Vec::new(),
+                started: Instant::now(),
+                abandoned: false,
             },
         );
         Ok(session_id)
@@ -1227,6 +1345,8 @@ impl Worker {
             sizing,
             reply,
             parked,
+            abandoned,
+            ..
         } = pending;
 
         let booted = match outcome {
@@ -1251,6 +1371,25 @@ impl Worker {
                 return;
             }
         };
+
+        // Everyone waiting on this boot was let go when it passed its deadline,
+        // so the VM it eventually produced has no owner.
+        if abandoned {
+            self.logger.log_line(&format!(
+                "session {session_id} booted after it was given up on; releasing it"
+            ));
+            start_session_release(
+                SessionRelease {
+                    session: Some(booted),
+                    store: Some(store),
+                    name,
+                },
+                session_id.to_string(),
+                &self.releases_in_flight,
+                None,
+            );
+            return;
+        }
 
         self.sessions.insert(
             session_id.to_string(),
@@ -1313,37 +1452,52 @@ impl Worker {
     /// Refuses while anything is still using it rather than cascading, since
     /// the sandboxes in a session are addressed individually and their owners
     /// still hold those ids.
-    fn release_session(&mut self, session_id: &str) -> Result<(), WorkerError> {
+    fn release_session(
+        &mut self,
+        session_id: &str,
+        reply: oneshot::Sender<Result<(), WorkerError>>,
+    ) {
         if !self.sessions.contains_key(session_id) {
-            return Err(WorkerError::UnknownSession(session_id.to_string()));
+            let _ = reply.send(Err(WorkerError::UnknownSession(session_id.to_string())));
+            return;
         }
 
         // The implicit session is shared by every request that named none, so
         // no single caller may release it.
         if self.default_session.as_deref() == Some(session_id) {
-            return Err(WorkerError::Rejected(anyhow::anyhow!(
+            let _ = reply.send(Err(WorkerError::Rejected(anyhow::anyhow!(
                 "session {session_id} is the daemon's implicit session and is released only \
                  once nothing is using it"
-            )));
+            ))));
+            return;
         }
 
         let hold = self.session_hold(session_id);
         if hold > 0 {
-            return Err(WorkerError::Rejected(anyhow::anyhow!(
+            let _ = reply.send(Err(WorkerError::Rejected(anyhow::anyhow!(
                 "session {session_id} still has {hold} sandbox(es) or operation(s) in it; \
                  deprovision them first"
-            )));
+            ))));
+            return;
         }
 
-        self.release_session_entry(session_id)
+        self.release_session_entry(session_id, Some(reply));
     }
 
-    /// Terminate and release one session's VM, returning its store slot.
+    /// Hand a session's VM to a thread that terminates it.
     ///
-    /// The caller has already established that nothing is using it.
-    fn release_session_entry(&mut self, session_id: &str) -> Result<(), WorkerError> {
+    /// Returns without waiting: stopping a VM is not instant, and every other
+    /// sandbox's work is serialized behind this thread.
+    fn release_session_entry(
+        &mut self,
+        session_id: &str,
+        reply: Option<oneshot::Sender<Result<(), WorkerError>>>,
+    ) {
         let Some(entry) = self.sessions.remove(session_id) else {
-            return Ok(());
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(()));
+            }
+            return;
         };
         if self.default_session.as_deref() == Some(session_id) {
             self.default_session = None;
@@ -1369,13 +1523,60 @@ impl Worker {
             sizing.gpu,
         ));
 
-        let released = container_steps::release_daemon_session(session, &name, &mut self.logger);
+        start_session_release(
+            SessionRelease {
+                session: Some(session),
+                store: Some(store),
+                name,
+            },
+            session_id.to_string(),
+            &self.releases_in_flight,
+            reply,
+        );
+    }
 
-        // Returned only after the terminate above, so the next lease never
-        // reaches a store still mounted.
-        drop(store);
+    /// Let go of the clients waiting on a boot that has run past its deadline.
+    ///
+    /// The entry stays and keeps its slot: the boot thread is still running and
+    /// may yet open that store.
+    fn reap_stuck_boots(&mut self) {
+        let deadline = session_boot_deadline();
+        let mut gave_up = Vec::new();
 
-        released.map_err(sr_err)
+        for (session_id, pending) in self.pending_sessions.iter_mut() {
+            if pending.abandoned || pending.started.elapsed() < deadline {
+                continue;
+            }
+            pending.abandoned = true;
+
+            if let Some(reply) = pending.reply.take() {
+                let _ = reply.send(Err(WorkerError::Backend(anyhow::anyhow!(
+                    "the WSLc session did not finish booting within {}s",
+                    deadline.as_secs()
+                ))));
+            }
+            for (_, parked) in std::mem::take(&mut pending.parked) {
+                let _ = parked.send(Err(WorkerError::Backend(anyhow::anyhow!(
+                    "the WSLc session this provision was waiting for did not finish \
+                     booting within {}s",
+                    deadline.as_secs()
+                ))));
+            }
+            gave_up.push(session_id.clone());
+        }
+
+        for session_id in gave_up {
+            // A later provision boots a fresh implicit session rather than
+            // parking behind one nothing is waiting for any more.
+            if self.default_session.as_deref() == Some(&session_id) {
+                self.default_session = None;
+            }
+            self.logger.log_line(&format!(
+                "session {session_id} has been booting for over {}s; the clients waiting \
+                 on it were let go",
+                deadline.as_secs()
+            ));
+        }
     }
 
     /// Release sessions that have held nothing for the empty-session grace.
@@ -1413,10 +1614,7 @@ impl Worker {
                 "session {session_id} has held nothing for {}s",
                 grace.as_secs()
             ));
-            if let Err(e) = self.release_session_entry(&session_id) {
-                self.logger
-                    .log_line(&format!("releasing idle session {session_id} failed: {e}"));
-            }
+            self.release_session_entry(&session_id, None);
         }
     }
 
@@ -1971,9 +2169,14 @@ impl Worker {
         mut self,
         execs_in_flight: usize,
         sessions_in_flight: usize,
+        releases_in_flight: usize,
         pull_outstanding: bool,
     ) {
-        if execs_in_flight > 0 || sessions_in_flight > 0 || pull_outstanding {
+        if execs_in_flight > 0
+            || sessions_in_flight > 0
+            || releases_in_flight > 0
+            || pull_outstanding
+        {
             std::mem::forget(std::mem::take(&mut self.containers));
 
             // Forgets each store lease with its handle, so the slot stays
@@ -2035,9 +2238,9 @@ impl Worker {
 
     /// Release every container and every session.
     ///
-    /// `drain_budget` bounds the whole teardown rather than each wait inside
-    /// it, so a daemon holding several sessions cannot spend one budget per
-    /// session.
+    /// `drain_budget` bounds waiting for in-flight work across every session,
+    /// and then bounds terminating their VMs separately, so one stuck pull
+    /// cannot leave the rest no time to release.
     fn shutdown(
         &mut self,
         rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
@@ -2145,14 +2348,55 @@ impl Worker {
             self.containers.clear();
         }
 
-        self.release_sessions_for_shutdown(deadline);
+        self.release_sessions_for_shutdown(rx, deadline, drain_budget);
+    }
+
+    /// Release a session whose boot landed after teardown had begun.
+    ///
+    /// A failed boot already dropped its guard inside `create_daemon_session`,
+    /// so only a successful one still owns a VM here.
+    fn release_booted_during_shutdown(
+        &mut self,
+        session_id: &str,
+        outcome: Result<BootedSession, WorkerError>,
+    ) {
+        let Some(pending) = self.pending_sessions.remove(session_id) else {
+            return;
+        };
+
+        let Ok(BootedSession(session)) = outcome else {
+            return;
+        };
+
+        self.logger.log_line(&format!(
+            "session {session_id} finished booting during shutdown; releasing it"
+        ));
+
+        match container_steps::release_daemon_session(session, &pending.name, &mut self.logger) {
+            Ok(()) => drop(pending.store),
+            Err(e) => {
+                self.logger.log_line(&format!(
+                    "releasing session {session_id} reported a failure: {}",
+                    e.error_message
+                ));
+
+                // The VM may still hold this store's VHDX open, so the slot
+                // must never be handed out again.
+                std::mem::forget(pending.store);
+            }
+        }
     }
 
     /// Release the sessions nothing is still using and abandon the rest.
     ///
     /// Runs while the SDK is still loaded, since a session handle's `Drop`
     /// calls into it.
-    fn release_sessions_for_shutdown(&mut self, deadline: Instant) {
+    fn release_sessions_for_shutdown(
+        &mut self,
+        rx: &mut mpsc::UnboundedReceiver<WorkerCommand>,
+        deadline: Instant,
+        drain_budget: Duration,
+    ) {
         let mut abandoned = false;
 
         // A boot still running holds the SDK and is about to open the store
@@ -2165,12 +2409,31 @@ impl Worker {
             std::mem::forget(std::mem::take(&mut self.pending_sessions));
             abandoned = true;
         } else {
-            // Every drained boot queued its report before releasing its count,
-            // so anything still pending here never got one. Dropping the entry
-            // returns its slot, which is correct: no VM was ever created on it.
+            // A boot queues its report before releasing its count, so a drained
+            // counter can still leave a live session handle sitting in the
+            // channel. Releasing those here is what stops their `Drop` reaching
+            // an unloaded `wslcsdk.dll`.
+            while !self.pending_sessions.is_empty() {
+                let Ok(cmd) = rx.try_recv() else {
+                    break;
+                };
+                match cmd {
+                    WorkerCommand::SessionBooted {
+                        session_id,
+                        outcome,
+                    } => self.release_booted_during_shutdown(&session_id, outcome),
+                    other => self.refuse_while_shutting_down(other),
+                }
+            }
+
+            // Whatever is left never queued a report, so no VM reached its
+            // slot and dropping the entry returns it.
             self.pending_sessions.clear();
         }
 
+        // Waiting first, so one session's stuck pull cannot spend the budget the
+        // terminates below need.
+        let mut drained = Vec::new();
         for (session_id, entry) in self.sessions.drain() {
             if !wait_for_in_flight(&entry.pulls_in_flight, deadline) {
                 self.logger.log_line(&format!(
@@ -2180,6 +2443,27 @@ impl Worker {
 
                 // Forgets the store lease with the session, so the slot stays
                 // held: the leaked session keeps the store's VHDX mounted.
+                std::mem::forget(entry);
+                abandoned = true;
+                continue;
+            }
+
+            drained.push((session_id, entry));
+        }
+
+        // A budget of its own rather than whatever the waits left behind, since
+        // leaking a slot costs capacity permanently and a slow terminate does
+        // not.
+        let release_deadline = Instant::now() + drain_budget;
+
+        for (session_id, entry) in drained {
+            // Terminating a VM is not instant, so N of them must not run
+            // unbounded.
+            if Instant::now() >= release_deadline {
+                self.logger.log_line(&format!(
+                    "the release budget expired before session {session_id} was released; \
+                     leaking it rather than returning a slot its VM still holds"
+                ));
                 std::mem::forget(entry);
                 abandoned = true;
                 continue;
@@ -2198,8 +2482,24 @@ impl Worker {
                     "releasing session {session_id} reported a failure: {}",
                     e.error_message
                 ));
+
+                // The VM may still hold this store's VHDX open, so the slot
+                // must never be handed out again.
+                std::mem::forget(store);
+                abandoned = true;
+                continue;
             }
             drop(store);
+        }
+
+        // A release thread is still calling SDK function pointers, so the DLL
+        // has to stay mapped until it finishes.
+        if !wait_for_in_flight(&self.releases_in_flight, release_deadline) {
+            self.logger.log_line(
+                "a WSLC session is still terminating; leaking the SDK rather than unloading \
+                 it under a release thread",
+            );
+            abandoned = true;
         }
 
         // Last, and only once every session that could be released has been:
@@ -2272,7 +2572,7 @@ pub fn spawn() -> Result<SessionHandle> {
                             worker.finish_session(&session_id, outcome, &worker_tx);
                         }
                         WorkerCommand::DeprovisionSession { config, reply } => {
-                            let _ = reply.send(worker.release_session(&config.session_id));
+                            worker.release_session(&config.session_id, reply);
                         }
                         WorkerCommand::Provision { config, reply } => {
                             worker.begin_provision(config, reply, &worker_tx);
@@ -2292,7 +2592,8 @@ pub fn spawn() -> Result<SessionHandle> {
                         }
                         WorkerCommand::ContainerCount { reply } => {
                             // This poll is the daemon's only periodic tick, so
-                            // the session reaper rides along on it.
+                            // the session reapers ride along on it.
+                            worker.reap_stuck_boots();
                             worker.reap_idle_sessions();
                             let _ = reply.send(worker.live_container_count());
                         }
@@ -2308,10 +2609,11 @@ pub fn spawn() -> Result<SessionHandle> {
             if served.is_err() {
                 let in_flight = worker.execs_in_flight.load(Ordering::SeqCst);
                 let booting = worker.sessions_in_flight.load(Ordering::SeqCst);
+                let releasing = worker.releases_in_flight.load(Ordering::SeqCst);
 
                 // A pull borrows the SDK and session the same way a run does.
                 let pull_outstanding = !image::wait_for_pulls_in_flight(Duration::ZERO);
-                worker.abandon_if_borrowed(in_flight, booting, pull_outstanding);
+                worker.abandon_if_borrowed(in_flight, booting, releasing, pull_outstanding);
             }
         })
         .map_err(|e| anyhow::anyhow!("spawn WSLc worker thread: {e}"))?;
@@ -2621,6 +2923,8 @@ mod tests {
                 sizing: SessionSizing::default(),
                 reply: None,
                 parked: Vec::new(),
+                started: Instant::now(),
+                abandoned: false,
             },
         );
     }
@@ -2801,6 +3105,14 @@ mod tests {
              daemon itself, with nothing able to reclaim any of them"
         );
 
+        assert!(
+            wait_for_in_flight(
+                &worker.releases_in_flight,
+                Instant::now() + Duration::from_secs(5)
+            ),
+            "the release thread must finish before the slot is inspected"
+        );
+
         let (relet, ()) = worker
             .store_slots
             .lease_with(|_| Ok::<(), ()>(()))
@@ -2890,9 +3202,7 @@ mod tests {
             .containers
             .insert("wslc:live".to_string(), test_entry(false));
 
-        let refusal = worker
-            .release_session(TEST_SESSION)
-            .expect_err("a session with a sandbox in it must not be released");
+        let refusal = refuse_release(&mut worker, TEST_SESSION);
 
         assert_eq!(refusal.kind(), ErrKind::Rejected);
         assert!(
@@ -2909,9 +3219,7 @@ mod tests {
         register_test_session(&mut worker, TEST_SESSION);
         worker.default_session = Some(TEST_SESSION.to_string());
 
-        let refusal = worker
-            .release_session(TEST_SESSION)
-            .expect_err("the implicit session must not be releasable by id");
+        let refusal = refuse_release(&mut worker, TEST_SESSION);
 
         assert_eq!(refusal.kind(), ErrKind::Rejected);
         assert!(worker.sessions.contains_key(TEST_SESSION));
@@ -2921,11 +3229,216 @@ mod tests {
     fn releasing_an_unknown_session_is_refused() {
         let mut worker = Worker::new();
 
-        let refusal = worker
-            .release_session("wslcsess:never-existed")
-            .expect_err("an unknown session must be refused");
+        let refusal = refuse_release(&mut worker, "wslcsess:never-existed");
 
         assert_eq!(refusal.kind(), ErrKind::NotProvisioned);
+    }
+
+    /// The reaper runs on the watchdog poll that every other request waits
+    /// behind, so terminating a VM must not happen on the worker thread.
+    /// Nothing else would ever answer these clients.
+    #[test]
+    fn a_boot_past_its_deadline_lets_its_waiting_clients_go() {
+        let (_root, mut worker) = worker_with_scratch_pool();
+        register_booting_session(&mut worker, TEST_SESSION);
+        worker.default_session = Some(TEST_SESSION.to_string());
+
+        let (reply, mut answer) = oneshot::channel();
+        let (parked, mut parked_answer) = oneshot::channel();
+        {
+            let pending = worker
+                .pending_sessions
+                .get_mut(TEST_SESSION)
+                .expect("the booting session");
+            pending.reply = Some(reply);
+            pending.parked.push((
+                ProvisionConfig {
+                    image: "alpine:latest".to_string(),
+                    image_tar_path: None,
+                    volumes: Vec::new(),
+                    network: Default::default(),
+                    port_mappings: Vec::new(),
+                    session_id: None,
+                },
+                parked,
+            ));
+            pending.started = Instant::now() - Duration::from_secs(60 * 60 * 24);
+        }
+
+        worker.reap_stuck_boots();
+
+        assert!(
+            answer
+                .try_recv()
+                .expect("the session request must be answered")
+                .is_err(),
+            "a boot nothing will ever report must not leave its client waiting"
+        );
+        assert!(
+            parked_answer
+                .try_recv()
+                .expect("the parked provision must be answered")
+                .is_err(),
+            "a provision parked behind a hung boot must be answered too"
+        );
+        assert!(
+            worker.default_session.is_none(),
+            "a later provision must boot a fresh implicit session rather than park \
+             behind one nothing is waiting for"
+        );
+    }
+
+    /// The boot thread is still running, so the store it is about to open must
+    /// not be handed to anything else.
+    #[test]
+    fn a_boot_given_up_on_keeps_its_store_slot() {
+        let (_root, mut worker) = worker_with_scratch_pool();
+        register_booting_session(&mut worker, TEST_SESSION);
+        let held = worker.pending_sessions[TEST_SESSION]
+            .store
+            .path()
+            .to_path_buf();
+        worker
+            .pending_sessions
+            .get_mut(TEST_SESSION)
+            .expect("the booting session")
+            .started = Instant::now() - Duration::from_secs(60 * 60 * 24);
+
+        worker.reap_stuck_boots();
+
+        let (next, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease after giving up");
+        assert_ne!(
+            next.path(),
+            held,
+            "the boot thread may still open this store, so its slot cannot be reissued"
+        );
+    }
+
+    /// A boot given up on still produces a VM, and nothing is waiting for it.
+    #[test]
+    fn a_boot_that_lands_after_being_given_up_on_is_released() {
+        static TERMINATED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn terminate_counts(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            TERMINATED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        unsafe extern "C" fn release_ok(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            0
+        }
+
+        TERMINATED.store(0, Ordering::SeqCst);
+
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel();
+        register_booting_session(&mut worker, TEST_SESSION);
+        worker
+            .pending_sessions
+            .get_mut(TEST_SESSION)
+            .expect("the booting session")
+            .started = Instant::now() - Duration::from_secs(60 * 60 * 24);
+
+        worker.reap_stuck_boots();
+
+        // SAFETY: neither function pointer dereferences the handle.
+        let booted = BootedSession(unsafe {
+            WslcSessionGuard::from_raw(std::ptr::dangling_mut(), terminate_counts, release_ok)
+        });
+        worker.finish_session(TEST_SESSION, Ok(booted), &worker_tx);
+
+        assert!(
+            wait_for_in_flight(
+                &worker.releases_in_flight,
+                Instant::now() + Duration::from_secs(5)
+            ),
+            "the release thread must finish"
+        );
+        assert_eq!(
+            TERMINATED.load(Ordering::SeqCst),
+            1,
+            "a VM nobody is waiting for must be stopped, not installed or leaked"
+        );
+        assert!(
+            !worker.sessions.contains_key(TEST_SESSION),
+            "a session given up on must not be installed by a late report"
+        );
+    }
+
+    #[test]
+    fn the_reaper_does_not_terminate_on_the_worker_thread() {
+        static STOPPING: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn terminate_slowly(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            STOPPING.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            0
+        }
+        unsafe extern "C" fn release_ok(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            0
+        }
+
+        STOPPING.store(0, Ordering::SeqCst);
+
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let (store, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease a scratch slot");
+
+        worker.sessions.insert(
+            TEST_SESSION.to_string(),
+            SessionEntry {
+                // SAFETY: neither function pointer dereferences the handle.
+                session: unsafe {
+                    WslcSessionGuard::from_raw(
+                        std::ptr::dangling_mut(),
+                        terminate_slowly,
+                        release_ok,
+                    )
+                },
+                store,
+                name: session_name(TEST_SESSION),
+                sizing: SessionSizing::default(),
+                pulls_in_flight: Arc::new(AtomicUsize::new(0)),
+                empty_since: None,
+            },
+        );
+
+        age_out(&mut worker, TEST_SESSION);
+
+        let started = Instant::now();
+        worker.reap_idle_sessions();
+        let on_worker = started.elapsed();
+
+        assert!(
+            on_worker < Duration::from_millis(200),
+            "the reaper returned in {on_worker:?}, so a 400ms terminate ran on the \
+             worker thread and stalled every other sandbox"
+        );
+
+        assert!(
+            wait_for_in_flight(
+                &worker.releases_in_flight,
+                Instant::now() + Duration::from_secs(5)
+            ),
+            "the release thread must still finish the terminate"
+        );
+        assert_eq!(
+            STOPPING.load(Ordering::SeqCst),
+            1,
+            "offloading must not skip stopping the VM"
+        );
     }
 
     #[test]
@@ -3018,6 +3531,195 @@ mod tests {
             relet.path(),
             slot,
             "a cleanly released session must give its store slot back"
+        );
+    }
+
+    /// Drive a release and read its refusal, which is sent before any thread
+    /// starts.
+    fn refuse_release(worker: &mut Worker, session_id: &str) -> WorkerError {
+        let (reply, mut answer) = oneshot::channel();
+        worker.release_session(session_id, reply);
+        answer
+            .try_recv()
+            .expect("a refusal answers without a release thread")
+            .expect_err("this release must be refused")
+    }
+
+    /// Release a session and wait for its thread to settle the store slot.
+    fn release_and_settle(worker: &mut Worker, session_id: &str) {
+        worker.release_session_entry(session_id, None);
+        assert!(
+            wait_for_in_flight(
+                &worker.releases_in_flight,
+                Instant::now() + Duration::from_secs(5)
+            ),
+            "the release thread must finish before the slot is inspected"
+        );
+    }
+
+    /// Register a session whose terminate reports a failure.
+    fn register_failing_session(worker: &mut Worker, session_id: &str) -> std::path::PathBuf {
+        unsafe extern "C" fn terminate_fails(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            -2147467259
+        }
+        unsafe extern "C" fn release_ok(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            0
+        }
+
+        // Non-null only because the guard rejects null; never used as a pointer.
+        let sentinel = std::ptr::dangling_mut();
+        let (store, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease a scratch slot");
+        let slot = store.path().to_path_buf();
+
+        worker.sessions.insert(
+            session_id.to_string(),
+            SessionEntry {
+                // SAFETY: neither function pointer dereferences the handle, so
+                // the guard owns a value it can release without touching
+                // memory.
+                session: unsafe {
+                    WslcSessionGuard::from_raw(sentinel, terminate_fails, release_ok)
+                },
+                store,
+                name: session_name(session_id),
+                sizing: SessionSizing::default(),
+                pulls_in_flight: Arc::new(AtomicUsize::new(0)),
+                empty_since: None,
+            },
+        );
+
+        slot
+    }
+
+    /// A VM that did not stop may still have the store's VHDX open, so the slot
+    /// cannot go back even though the session entry is gone.
+    #[test]
+    fn a_failed_terminate_keeps_its_slot_out_of_the_pool() {
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let held = register_failing_session(&mut worker, TEST_SESSION);
+
+        release_and_settle(&mut worker, TEST_SESSION);
+
+        let (next, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease after the failed release");
+        assert_ne!(
+            next.path(),
+            held,
+            "reissuing the slot of a VM that did not stop is the sharing violation \
+             the lease exists to prevent"
+        );
+    }
+
+    /// The same rule on the teardown path, which releases sessions through its
+    /// own loop rather than `release_session_entry`.
+    #[test]
+    fn shutdown_keeps_the_slot_of_a_session_that_would_not_terminate() {
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let held = register_failing_session(&mut worker, TEST_SESSION);
+
+        worker.shutdown(&mut rx, Duration::from_millis(100));
+
+        let (next, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease after teardown");
+        assert_ne!(
+            next.path(),
+            held,
+            "teardown must not hand back a slot whose VM may still hold the VHDX"
+        );
+    }
+
+    /// A drained boot counter can still leave a live handle in the channel.
+    #[test]
+    fn shutdown_releases_a_boot_that_landed_while_it_was_draining() {
+        static TERMINATED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn terminate_counts(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            TERMINATED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        unsafe extern "C" fn release_ok(
+            _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
+        ) -> i32 {
+            0
+        }
+
+        TERMINATED.store(0, Ordering::SeqCst);
+
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        register_booting_session(&mut worker, TEST_SESSION);
+        let slot = worker.pending_sessions[TEST_SESSION]
+            .store
+            .path()
+            .to_path_buf();
+
+        // Non-null only because the guard rejects null; never used as a pointer.
+        let sentinel = std::ptr::dangling_mut();
+
+        // SAFETY: neither function pointer dereferences the handle.
+        let booted = BootedSession(unsafe {
+            WslcSessionGuard::from_raw(sentinel, terminate_counts, release_ok)
+        });
+        tx.send(WorkerCommand::SessionBooted {
+            session_id: TEST_SESSION.to_string(),
+            outcome: Ok(booted),
+        })
+        .expect("queue the boot report");
+
+        worker.shutdown(&mut rx, Duration::from_millis(100));
+
+        assert_eq!(
+            TERMINATED.load(Ordering::SeqCst),
+            1,
+            "a session that booted during teardown must be released while the SDK \
+             is still loaded, not left for the channel to drop"
+        );
+
+        let (relet, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease after teardown");
+        assert_eq!(
+            relet.path(),
+            slot,
+            "a session released cleanly during teardown gives its slot back"
+        );
+    }
+
+    /// Terminating a VM is not instant, so N of them must not run past the
+    /// budget the whole teardown shares.
+    #[test]
+    fn shutdown_leaks_sessions_it_has_no_budget_left_to_release() {
+        let (_root, mut worker) = worker_with_scratch_pool();
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        register_test_session(&mut worker, TEST_SESSION);
+        let held = worker.sessions[TEST_SESSION].store.path().to_path_buf();
+
+        worker.shutdown(&mut rx, Duration::ZERO);
+
+        let (next, ()) = worker
+            .store_slots
+            .lease_with(|_| Ok::<(), ()>(()))
+            .expect("lease after teardown");
+        assert_ne!(
+            next.path(),
+            held,
+            "a session teardown ran out of budget to terminate still has its VM, \
+             so its slot must stay held"
         );
     }
 
@@ -4302,7 +5004,7 @@ mod tests {
             },
         );
 
-        worker.abandon_if_borrowed(1, 0, false);
+        worker.abandon_if_borrowed(1, 0, 0, false);
 
         assert!(
             matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
@@ -4340,7 +5042,7 @@ mod tests {
             .containers
             .insert("wslc:busy".to_string(), flagged_entry(release));
 
-        worker.abandon_if_borrowed(1, 0, false);
+        worker.abandon_if_borrowed(1, 0, 0, false);
 
         assert!(
             !RELEASED.load(Ordering::SeqCst),
@@ -4362,7 +5064,7 @@ mod tests {
             .containers
             .insert("wslc:pulling".to_string(), flagged_entry(release));
 
-        worker.abandon_if_borrowed(0, 0, true);
+        worker.abandon_if_borrowed(0, 0, 0, true);
 
         assert!(
             !RELEASED.load(Ordering::SeqCst),
@@ -4384,7 +5086,7 @@ mod tests {
             .containers
             .insert("wslc:idle".to_string(), flagged_entry(release));
 
-        worker.abandon_if_borrowed(0, 0, false);
+        worker.abandon_if_borrowed(0, 0, 0, false);
 
         assert!(
             RELEASED.load(Ordering::SeqCst),
@@ -4440,6 +5142,130 @@ mod tests {
     /// The SDK has to accept the name derived from a session id. Two sessions
     /// under one name is an untested failure mode, so the names must be
     /// distinct *and* usable.
+    /// The behaviour the whole change exists for: a container lands in the
+    /// session it named, and releasing one session leaves the other working.
+    ///
+    /// A daemon that ignored `session_id` and routed everything through the
+    /// implicit session would pass the single-session tests above.
+    #[tokio::test]
+    #[ignore = "requires a WSL2 host with alpine:latest cached in the daemon store slots"]
+    async fn each_session_runs_its_own_sandbox_and_outlives_the_others_release() {
+        async fn run_echo(handle: &SessionHandle, sandbox_id: &str, text: &str) -> String {
+            let mut exec = handle
+                .exec(
+                    ExecConfig {
+                        exec_id: format!("per-session-{text}"),
+                        run_token: format!("per-session-{text}-run"),
+                        sandbox_id: sandbox_id.to_string(),
+                        script_code: format!("echo {text}"),
+                        working_directory: String::new(),
+                        env: Vec::new(),
+                        env_scope: EnvScope::Merge,
+                        timeout_ms: 30_000,
+                    },
+                    None,
+                )
+                .await
+                .expect("exec must start");
+
+            let mut stdout = Vec::new();
+            while let Some((kind, data)) = exec.output.recv().await {
+                if kind == OutStream::Stdout {
+                    stdout.extend_from_slice(&data);
+                }
+            }
+            let _ = exec.done.await;
+            String::from_utf8_lossy(&stdout).trim().to_string()
+        }
+
+        async fn sandbox_in(handle: &SessionHandle, session_id: &str) -> String {
+            let sandbox_id = handle
+                .provision(ProvisionConfig {
+                    image: "alpine:latest".to_string(),
+                    image_tar_path: None,
+                    volumes: Vec::new(),
+                    network: Default::default(),
+                    port_mappings: Vec::new(),
+                    session_id: Some(session_id.to_string()),
+                })
+                .await
+                .expect("provision into the named session");
+            handle
+                .start(StartConfig {
+                    sandbox_id: sandbox_id.clone(),
+                })
+                .await
+                .expect("start the sandbox");
+            sandbox_id
+        }
+
+        let handle = spawn().unwrap();
+
+        let first = handle
+            .provision_session(ProvisionSessionConfig::default())
+            .await
+            .expect("first session");
+        let second = handle
+            .provision_session(ProvisionSessionConfig::default())
+            .await
+            .expect("second session");
+        assert_ne!(first, second);
+
+        let in_first = sandbox_in(&handle, &first).await;
+        let in_second = sandbox_in(&handle, &second).await;
+
+        assert_eq!(run_echo(&handle, &in_first, "one").await, "one");
+        assert_eq!(
+            run_echo(&handle, &in_second, "two").await,
+            "two",
+            "a second session's sandbox must run in its own VM"
+        );
+
+        // Each sandbox is held by the session it named, so neither session can
+        // be released while its own sandbox is alive.
+        for session_id in [&first, &second] {
+            let refusal = handle
+                .deprovision_session(DeprovisionSessionConfig {
+                    session_id: session_id.clone(),
+                })
+                .await
+                .expect_err("a session holding a sandbox must not be released");
+            assert_eq!(refusal.kind(), ErrKind::Rejected);
+        }
+
+        handle
+            .deprovision(DeprovisionConfig {
+                sandbox_id: in_first.clone(),
+            })
+            .await
+            .expect("deprovision the first sandbox");
+        handle
+            .deprovision_session(DeprovisionSessionConfig {
+                session_id: first.clone(),
+            })
+            .await
+            .expect("the first session is empty now");
+
+        assert_eq!(
+            run_echo(&handle, &in_second, "still-here").await,
+            "still-here",
+            "releasing one session must not disturb another session's running sandbox"
+        );
+
+        handle
+            .deprovision(DeprovisionConfig {
+                sandbox_id: in_second,
+            })
+            .await
+            .expect("deprovision the second sandbox");
+        handle
+            .deprovision_session(DeprovisionSessionConfig { session_id: second })
+            .await
+            .expect("the second session is empty now");
+
+        handle.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires a WSL2 host with the WSLc SDK installed"]
     async fn two_sessions_coexist_in_one_daemon() {
