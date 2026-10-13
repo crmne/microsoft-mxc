@@ -116,7 +116,17 @@ pub fn available_backends() -> Vec<AvailableBackend> {
                 "failed to query identity-less loopback proxy support: {error}"
             )),
         }
-        windows_backends(tier, support)
+        windows_backends(
+            tier,
+            support,
+            WindowsHostAvailability {
+                windows_sandbox:
+                    crate::windows_sandbox_lifecycle::availability::is_windows_sandbox_available(),
+                wslc: wslc_host_available(),
+                isolation_session: isolation_session_host_available(),
+                hyperlight: hyperlight_host_available(),
+            },
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -134,8 +144,15 @@ pub fn to_json_pretty(backends: &[AvailableBackend]) -> Result<String, serde_jso
 
 #[cfg(target_os = "macos")]
 fn macos_backends() -> Vec<AvailableBackend> {
+    macos_backends_with(std::path::Path::new("/usr/bin/sandbox-exec").exists())
+}
+
+/// Split from [`macos_backends`] so the reporting is testable without
+/// depending on what the test host has installed.
+#[cfg(target_os = "macos")]
+fn macos_backends_with(sandbox_exec_present: bool) -> Vec<AvailableBackend> {
     let mut backends = Vec::new();
-    if std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+    if sandbox_exec_present {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::Seatbelt.wire_name(),
         ));
@@ -145,13 +162,28 @@ fn macos_backends() -> Vec<AvailableBackend> {
 
 #[cfg(target_os = "linux")]
 fn linux_backends() -> Vec<AvailableBackend> {
+    linux_backends_with(
+        crate::bwrap_common::bwrap_version::probe_bwrap().is_ok(),
+        crate::bwrap_common::proxy_network::probe_proxy_enforcement,
+        crate::lxc_common::availability::is_lxc_available(),
+    )
+}
+
+/// Split from [`linux_backends`] so the reporting is testable without a host
+/// that has (or lacks) the backends. `proxy_enforcement` stays a closure
+/// because the dependency walk costs several subprocess spawns and is only
+/// meaningful once `bwrap` itself is usable.
+#[cfg(target_os = "linux")]
+fn linux_backends_with(
+    bwrap_available: bool,
+    proxy_enforcement: impl FnOnce() -> Result<(), String>,
+    lxc_available: bool,
+) -> Vec<AvailableBackend> {
     let mut backends = Vec::new();
-    if crate::bwrap_common::bwrap_version::probe_bwrap().is_ok() {
-        backends.push(bubblewrap_backend(
-            crate::bwrap_common::proxy_network::probe_proxy_enforcement(),
-        ));
+    if bwrap_available {
+        backends.push(bubblewrap_backend(proxy_enforcement()));
     }
-    if crate::lxc_common::availability::is_lxc_available() {
+    if lxc_available {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::Lxc.wire_name(),
         ));
@@ -189,10 +221,65 @@ fn capture_denials_available(native_capture: bool, guarded_capture: bool) -> boo
     native_capture || guarded_capture
 }
 
+/// Host checks for the optional Windows backends, resolved by
+/// [`available_backends`] and injected so the reporting is testable without a
+/// host that has (or lacks) them. A field is `false` when its feature or
+/// architecture gate is off.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowsHostAvailability {
+    windows_sandbox: bool,
+    wslc: bool,
+    isolation_session: bool,
+    hyperlight: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn wslc_host_available() -> bool {
+    // Requires the host to actually run it (WSL2 + the WSLC runtime present),
+    // matching `platform_support()` and the runner preflight. `WslcSdk::load()`
+    // alone only proves the DLL and its exports resolve.
+    #[cfg(feature = "wslc")]
+    {
+        crate::wslc_common::is_available()
+    }
+    #[cfg(not(feature = "wslc"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn isolation_session_host_available() -> bool {
+    // Available when the `IsoSessionOps` WinRT class is registered on the OS.
+    #[cfg(feature = "isolation_session")]
+    {
+        crate::isolation_session_common::availability::is_isolation_session_available()
+    }
+    #[cfg(not(feature = "isolation_session"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hyperlight_host_available() -> bool {
+    // WHP is delay-loaded; check before setup boots a VM.
+    #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
+    {
+        crate::hyperlight_common::is_whp_available()
+    }
+    #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_backends(
     tier: crate::process_container_common::fallback_detector::IsolationTier,
     support: ProcessContainerCapabilities,
+    hosts: WindowsHostAvailability,
 ) -> Vec<AvailableBackend> {
     // `processcontainer` is always present and the only backend with a tier
     // ladder, so it carries its effective (highest-reachable) tier.
@@ -222,33 +309,25 @@ fn windows_backends(
     };
     let mut backends = vec![process_container];
 
-    if crate::windows_sandbox_lifecycle::availability::is_windows_sandbox_available() {
+    if hosts.windows_sandbox {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::WindowsSandbox.wire_name(),
         ));
     }
 
-    // Report WSLC only when the host can actually run it (WSL2 + the WSLC
-    // runtime present), matching `platform_support()` and the runner preflight.
-    // `WslcSdk::load()` alone only proves the DLL and its exports resolve.
-    #[cfg(feature = "wslc")]
-    if crate::wslc_common::is_available() {
+    if hosts.wslc {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::Wslc.wire_name(),
         ));
     }
 
-    // Available when the `IsoSessionOps` WinRT class is registered on the OS.
-    #[cfg(feature = "isolation_session")]
-    if crate::isolation_session_common::availability::is_isolation_session_available() {
+    if hosts.isolation_session {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::IsolationSession.wire_name(),
         ));
     }
 
-    // WHP is delay-loaded; check before setup boots a VM.
-    #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
-    if crate::hyperlight_common::is_whp_available() {
+    if hosts.hyperlight {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::Hyperlight.wire_name(),
         ));
@@ -296,51 +375,47 @@ mod tests {
         IsolationTier::ALL.iter().map(|t| t.as_str()).collect()
     }
 
-    /// The host detector [`available_backends`] calls for each backend, or
-    /// `None` when it has none. Exhaustive on purpose: a new backend cannot
-    /// compile without naming its detector here, and
-    /// `probe_coverage_matches_the_host_detector_mapping` holds it to the
-    /// `ProbeCoverage` the registry declares.
-    fn host_detector(backend: &ContainmentBackend) -> Option<&'static str> {
-        match backend {
-            ContainmentBackend::ProcessContainer => Some("always reported on Windows"),
-            ContainmentBackend::Wslc => Some("wslc_common::is_available"),
-            ContainmentBackend::Lxc => Some("lxc_common::availability::is_lxc_available"),
-            ContainmentBackend::Vm => None,
-            ContainmentBackend::MicroVm => None,
-            ContainmentBackend::Hyperlight => Some("hyperlight_common::is_whp_available"),
-            ContainmentBackend::WindowsSandbox => {
-                Some("windows_sandbox_lifecycle::availability::is_windows_sandbox_available")
-            }
-            ContainmentBackend::IsolationSession => {
-                Some("isolation_session_common::availability::is_isolation_session_available")
-            }
-            ContainmentBackend::Seatbelt => Some("/usr/bin/sandbox-exec presence"),
-            ContainmentBackend::Bubblewrap => Some("bwrap_common::bwrap_version::probe_bwrap"),
-        }
+    /// Runs the real platform reporting with every host check forced to pass,
+    /// so the assertions below exercise production wiring rather than whatever
+    /// this particular host happens to have installed.
+    #[cfg(target_os = "windows")]
+    fn backends_with_host_checks_passing() -> Vec<AvailableBackend> {
+        windows_backends(
+            select_tier(true, false),
+            ProcessContainerCapabilities::default(),
+            WindowsHostAvailability {
+                windows_sandbox: true,
+                wslc: true,
+                isolation_session: true,
+                hyperlight: true,
+            },
+        )
     }
 
-    /// Ties the registry's declaration to real detection: a backend registered
-    /// as `Detected` must name a detector, and one registered as `NotDetected`
-    /// must not have one.
+    #[cfg(target_os = "linux")]
+    fn backends_with_host_checks_passing() -> Vec<AvailableBackend> {
+        linux_backends_with(true, || Ok(()), true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn backends_with_host_checks_passing() -> Vec<AvailableBackend> {
+        macos_backends_with(true)
+    }
+
+    /// The forward half of the probe-coverage gate: every backend the registry
+    /// claims to detect on this target must actually be emitted by the real
+    /// reporting function once its host check passes. Registering a backend as
+    /// `Detected` without adding a branch to `available_backends()` fails here.
     #[test]
-    fn probe_coverage_matches_the_host_detector_mapping() {
-        for entry in backend_registry::all() {
-            let detector = host_detector(&entry.backend);
-            match &entry.probe_coverage {
-                ProbeCoverage::Detected => assert!(
-                    detector.is_some(),
-                    "{:?} is registered as Detected but available_backends() has no detector \
-                     for it",
-                    entry.backend
-                ),
-                ProbeCoverage::NotDetected(reason) => assert!(
-                    detector.is_none(),
-                    "{:?} is registered as NotDetected ({reason}) but names the detector {:?}",
-                    entry.backend,
-                    detector
-                ),
-            }
+    fn every_detected_backend_is_reported_when_its_host_checks_pass() {
+        let reported = backends_with_host_checks_passing();
+        for name in backend_registry::detected_on_current_target() {
+            assert!(
+                reported.iter().any(|entry| entry.backend == name),
+                "{name} is registered as detected on {}, but the probe never reports it even \
+                 with every host check passing",
+                std::env::consts::OS
+            );
         }
     }
 
@@ -457,19 +532,16 @@ mod tests {
         }
     }
 
-    /// A backend registered as having no host detector must not surface here;
-    /// the registration and the probe are two halves of one decision.
+    /// The reverse half of the gate: a backend registered as having no host
+    /// detector must stay absent even with every host check forced to pass.
     #[test]
     fn backends_without_a_host_detector_are_never_reported() {
-        let reported: Vec<String> = available_backends()
-            .into_iter()
-            .map(|entry| entry.backend)
-            .collect();
+        let reported = backends_with_host_checks_passing();
         for entry in backend_registry::all() {
             if let ProbeCoverage::NotDetected(reason) = &entry.probe_coverage {
                 let name = entry.backend.wire_name();
                 assert!(
-                    !reported.contains(&name.to_string()),
+                    !reported.iter().any(|entry| entry.backend == name),
                     "{name} is reported by available_backends() but registered as undetected: \
                      {reason}"
                 );
@@ -567,6 +639,7 @@ mod tests {
                     capture_denials: capture_denials_available,
                     ..Default::default()
                 },
+                WindowsHostAvailability::default(),
             );
             let process_container = backends
                 .iter()
@@ -594,6 +667,7 @@ mod tests {
                 ingress_host_loopback_allow: true,
                 ..Default::default()
             },
+            WindowsHostAvailability::default(),
         );
         let process_container = backends
             .iter()
@@ -628,6 +702,7 @@ mod tests {
                     identityless_loopback_proxy: true,
                     ..Default::default()
                 },
+                WindowsHostAvailability::default(),
             );
             let process_container = backends
                 .iter()
@@ -651,6 +726,7 @@ mod tests {
                     ingress_host_loopback_allow: ingress_supported,
                     ..Default::default()
                 },
+                WindowsHostAvailability::default(),
             );
             let process_container = &backends[0];
             assert_eq!(
@@ -680,6 +756,7 @@ mod tests {
                 warnings: vec![warning.clone()],
                 ..Default::default()
             },
+            WindowsHostAvailability::default(),
         );
         assert_eq!(backends[0].warnings, vec![warning]);
         assert!(!backends[0]

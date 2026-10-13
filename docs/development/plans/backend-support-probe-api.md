@@ -98,9 +98,9 @@ ones.
 | Backend | How presence is detected today | Where | Risk with this method |
 | --- | --- | --- | --- |
 | `base-container` | `BaseContainerRunner::is_base_container_api_present()` calls `IsApiSetImplemented` for the process-security-environment API set. It does not load `processmodel.dll`, create a security environment, or start a process. | Rust | This proves that Windows implements the API-set contract; request-specific support bits are queried separately when the policy requires them. |
-| `windows_sandbox` | `isWindowsSandboxAvailable()` runs `dism /online /get-featureinfo `<br>`/featurename:Containers-DisposableClientVM ` and looks for `State : Enabled`<br>if DISM throws (usually non-elevated) it falls back to<br>`fs.existsSync(%SystemRoot%\\System32\\WindowsSandbox.exe)`; result cached. | TypeScript SDK | `dism /online` needs elevation, so a non-elevated caller can't tell *disabled* from<br>*no permission* and drops to the exe-existence checkwhich proves the feature is installed,<br>not that a sandbox VM can boot. (Will move to Rust) |
-| `lxc` | `isLxcAvailable()` runs `lxc-ls --version`; a clean exit means available. | TypeScript SDK | Only proves the `lxc-ls` CLI is on `PATH`, not that liblxc is loadable or that the caller has<br>the privileges to actually start a container, so it can report available on a host where a real run fails.<br>(Will move to Rust) |
-| `wslc` | `WslcSdk::load()` loads `wslcsdk.dll` from the executable's own directory;<br>validates that every required export resolves. | Rust (execute path) | Runs on the *execute* path, not as a cheap standalone probe:<br>it actually loads the DLL and resolves symbols. Proves the SDK runtime loads,<br>not that a WSL distro/runtime is functional. Feature-gated. |
+| `windows_sandbox` | `isWindowsSandboxAvailable()` runs `dism /online /get-featureinfo `<br>`/featurename:Containers-DisposableClientVM ` and looks for `State : Enabled`<br>if DISM throws (usually non-elevated) it falls back to<br>`fs.existsSync(%SystemRoot%\\System32\\WindowsSandbox.exe)`; result cached. | TypeScript SDK | `dism /online` needs elevation, so a non-elevated caller can't tell *disabled* from<br>*no permission* and drops to the exe-existence checkwhich proves the feature is installed,<br>not that a sandbox VM can boot. (Also in Rust: `windows_sandbox_lifecycle::availability`; the TypeScript copy is removed by §4.2 step 2.) |
+| `lxc` | `isLxcAvailable()` runs `lxc-ls --version`; a clean exit means available. | TypeScript SDK | Only proves the `lxc-ls` CLI is on `PATH`, not that liblxc is loadable or that the caller has<br>the privileges to actually start a container, so it can report available on a host where a real run fails.<br>(Also in Rust: `lxc_common::availability`; the TypeScript copy is removed by §4.2 step 2.) |
+| `wslc` | `wslc_common::is_available()` confirms WSL2 and the WSLC runtime are present. | Rust | Resolving `wslcsdk.dll` alone is not sufficient and is not what this checks;<br>`WslcSdk::load()` still runs on the *execute* path. Feature-gated. |
 
 ### 3.2 Isolation tiers (process-container only)
 
@@ -120,27 +120,36 @@ reachable, already exist in `process_container_common`:
 
 ### 4.1 Backends still missing a Rust detector
 
-Four backends have no *probe-suitable* (cheap, no persistent host mutation, no
-process/VM launch) host detector in Rust today, so a truthful availability signal
-for them **cannot be built just yet**.
+Only `microvm` lacks a *probe-suitable* (cheap, no persistent host mutation, no
+process/VM launch) host detector in Rust, so a truthful availability signal for
+it **cannot be built just yet**. `vm` is an abstract intent that resolves to a
+concrete backend per host and is never probed in its own right.
 
 | Backend | What a real probe needs | What exists today | Risk if faked |
 | --- | --- | --- | --- |
-| `windows_sandbox` | DISM/registry check of the *Containers-DisposableClientVM* optional feature | only a private "is the `.exe` on disk" check | reports available when the feature is off → launch fails |
-| `isolation_session` | activation of the in-proc `Windows.AI.IsolationSession.Preview` `IsoSessionOps` runtime class succeeds (the API class is registered on the OS **and** its OS feature gate is on) **and** the backend feature is compiled | as of #761, detection queries whether the API class is registered rather than gating on a build number; a `CLASS_E_CLASSNOTAVAILABLE` / `REGDB_E_CLASSNOTREG` activation failure means unavailable | none for false-availability now — a machine without the API registered fails activation cleanly; still needs a cheap probe seam so callers don't have to attempt a real activation |
 | `microvm` | feature compiled, NanVix runtime files staged, and WHP usable on Windows or `/dev/kvm` readable/writable on Linux | nothing | checking only a hypervisor can report availability when required runtime files are missing |
-| `hyperlight` | hypervisor present + feature compiled | nothing | same VM-boot risk |
+
+The detectors for the other previously-missing backends:
+
+| Backend | Detector | Note |
+| --- | --- | --- |
+| `windows_sandbox` | `WindowsSandbox.exe` present in the system directory | Windows installs it only with *Containers-DisposableClientVM* enabled. The DISM query needs elevation and this probe runs unelevated, so the `.exe` check is the probe, not a fallback. |
+| `isolation_session` | `IsoSessionOps` activates and reports a `LocalAgentUser` feature level above zero | Queries API-class registration rather than a build number (#761); a `CLASS_E_CLASSNOTAVAILABLE` / `REGDB_E_CLASSNOTREG` activation failure means unavailable. |
+| `lxc` | `lxc-ls --version` exits cleanly within a 3s bound | §4.2, step 1. |
+
+`hyperlight` has `is_whp_available()`, which checks the hypervisor without
+booting a VM.
 
 ### 4.2 The parity rule: detect once, project into TS
 
-Detection is split by layer today : `base-container`/`wslc` are Rust-only, while
-`windows_sandbox`/`lxc` are TypeScript-only, so the two layers can and already
-do disagree. The fix is: detect each capability in exactly one place (Rust), and
-have TypeScript read that result rather than compute its own.
+Rust detects every backend that has a detector, but `getPlatformSupport()` still
+runs its own `dism`/`lxc-ls`, so the two layers can disagree. The fix is: detect
+each capability in exactly one place (Rust), and have TypeScript read that
+result rather than compute its own.
 
 | Step | What | Why it gives parity |
 | --- | --- | --- |
-| 1. Consolidate detectors in Rust | Port the two TypeScript-only checks (`windows_sandbox` DISM/feature check, `lxc-ls`) into Rust<br>so `available_backends()` covers every backend. | Each backend has exactly one detector. |
+| 1. Consolidate detectors in Rust — **landed** | The `windows_sandbox` and `lxc` checks live in Rust<br>(`windows_sandbox_lifecycle::availability`, `lxc_common::availability`), so `available_backends()` covers every backend with a detector. | Each backend has exactly one detector. |
 | 2. TypeScript stops probing itself | `getPlatformSupport()` reads the native backend-availability result instead of running its own `dism`/`lxc-ls`.<br>The transport must be **side-effect-free**: `wxc-exec --probe` runs *after* `recover_orphaned_state()` (which can restore/prune DACL state on the host), so it cannot be extended unchanged without violating the read-only contract.<br>Instead, expose backend availability via a dedicated mode handled **before** DACL recovery (e.g. `wxc-exec --available-backends`), or directly through `mxc_ffi`. | TypeScript becomes a pure projection of the Rust result, without triggering host mutation. |
 | 3. Names flow from serde | Backend names (`Containment`) and tier strings (`IsolationTier::as_str()`) are already Rust-serialized;<br>TypeScript consumes them as-is instead of hand-re-encoding. | Removes the wire-name drift class structurally. |
 
@@ -172,22 +181,24 @@ test host happens to have `slirp4netns` installed.
 - A serde snapshot pins the camelCase capability name (`"proxyEnforcement"`) and verifies that
 `capabilities` and `warnings` are **omitted** when empty.
 - `wslc` appears when `wslc_common::is_available()` confirms WSL2 and the WSLC runtime are present;
-resolving `wslcsdk.dll` alone is not sufficient. Each backend declares a
-`ProbeCoverage` in `mxc_engine::backend_registry`, and a test asserts that one registered as
-`NotDetected` never appears in the output.
+resolving `wslcsdk.dll` alone is not sufficient. Each backend declares a `ProbeCoverage` in
+`mxc_engine::backend_registry`, naming either the targets it is detected on or why it has no
+detector. The platform reporting functions take their host checks as parameters, so two tests run
+the real reporting with every check forced to pass: one asserts every backend declared detected on
+the current target is reported, the other that a backend declared `NotDetected` still never is.
+Registering a backend as detected without adding a branch to `available_backends()` fails the first.
 - The TypeScript `getPlatformSupport()` output matches the native probe (parity by projection, §4.2),
  guarding against the two layers drifting.
 
 ## 6. Follow-up work items
 
-Writing the missing detectors and wiring the TypeScript projection, one issue each:
-1. `windows_sandbox` - optional-feature (DISM/registry) detector.
-2. `isolation_session` - probe whether the `Windows.AI.IsolationSession.Preview` `IsoSessionOps` API class is registered on the OS (activation-factory resolvable), replacing the old build-number gate (see #761), and expose it to Rust.
-3. `microvm` - hypervisor-presence probe. `hyperlight` has one (`is_whp_available()`); `microvm`
+Remaining detector and TypeScript-projection work, one issue each. The
+`windows_sandbox`, `isolation_session`, and `lxc` detectors have landed in Rust
+and are registered as `ProbeCoverage::Detected`.
+
+1. `microvm` - hypervisor-presence probe. `hyperlight` has one (`is_whp_available()`); `microvm`
 is registered as `ProbeCoverage::NotDetected` until its detector lands.
-4. `lxc` - port the `lxc-ls` presence check from TypeScript to Rust,
-so the probe (not just the SDK) can report it (§4.2, step 1).
-5. TypeScript projection - make `getPlatformSupport()` read the native backend availability via a
+2. TypeScript projection - make `getPlatformSupport()` read the native backend availability via a
 side-effect-free transport (e.g. a new `wxc-exec --available-backends` mode handled **before**
 `recover_orphaned_state()`, or `mxc_ffi`) instead of running its own `dism`/`lxc-ls`, so the two
 layers can't drift (§4.2, step 2). Do **not** extend the existing `--probe` flag: it runs after

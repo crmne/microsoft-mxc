@@ -15,8 +15,9 @@ use crate::mxc_common::models::ContainmentBackend;
 /// someone deciding whether the host probe reports it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProbeCoverage {
-    /// Reported by `available_backends()` whenever its host detection succeeds.
-    Detected,
+    /// Reported by `available_backends()` on the listed `target_os` values
+    /// whenever its host detection succeeds.
+    Detected(&'static [&'static str]),
     /// Never reported, with the reason it has no host detector.
     NotDetected(&'static str),
 }
@@ -34,17 +35,17 @@ static BACKENDS: [BackendRegistration; 10] = [
     BackendRegistration {
         backend: ContainmentBackend::ProcessContainer,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["windows"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::Wslc,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["windows"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::Lxc,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["linux"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::Vm,
@@ -65,27 +66,27 @@ static BACKENDS: [BackendRegistration; 10] = [
     BackendRegistration {
         backend: ContainmentBackend::Hyperlight,
         experimental: true,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["windows"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::WindowsSandbox,
         experimental: true,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["windows"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::IsolationSession,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["windows"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::Seatbelt,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["macos"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::Bubblewrap,
         experimental: false,
-        probe_coverage: ProbeCoverage::Detected,
+        probe_coverage: ProbeCoverage::Detected(&["linux"]),
     },
 ];
 
@@ -118,6 +119,20 @@ pub(crate) fn all_containment_names() -> Vec<String> {
     all()
         .iter()
         .map(|entry| entry.backend.wire_name().to_string())
+        .collect()
+}
+
+/// Wire names of the backends the registry claims the probe detects on the
+/// target this build runs on.
+#[cfg(test)]
+pub(crate) fn detected_on_current_target() -> Vec<&'static str> {
+    all()
+        .iter()
+        .filter(|entry| match &entry.probe_coverage {
+            ProbeCoverage::Detected(targets) => targets.contains(&std::env::consts::OS),
+            ProbeCoverage::NotDetected(_) => false,
+        })
+        .map(|entry| entry.backend.wire_name())
         .collect()
 }
 
@@ -197,6 +212,28 @@ mod tests {
                     "{:?} must say why it has no host detector",
                     entry.backend
                 );
+            }
+        }
+    }
+
+    /// An empty or unrecognized target list would satisfy the probe-coverage
+    /// gate vacuously, so a detected backend must name real targets.
+    #[test]
+    fn detected_backends_name_supported_targets() {
+        for entry in all() {
+            if let ProbeCoverage::Detected(targets) = &entry.probe_coverage {
+                assert!(
+                    !targets.is_empty(),
+                    "{:?} is registered as Detected but names no target",
+                    entry.backend
+                );
+                for target in *targets {
+                    assert!(
+                        ["windows", "linux", "macos"].contains(target),
+                        "{:?} names the unknown target {target:?}",
+                        entry.backend
+                    );
+                }
             }
         }
     }

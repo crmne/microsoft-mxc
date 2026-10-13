@@ -57,10 +57,11 @@ Shared parsing and normalization live in the `mxc_common` module; backend-specif
 validation and enforcement live with each backend.
 
 `mxc_engine/src/backend_registry.rs` owns backend registration metadata,
-including experimental classification, keyed by the shared `ContainmentBackend`
-enum. Runtime authorization consults that registry. Exact-contract publication,
-build-feature availability, and host-capability probing remain separate; the
-registry neither dispatches workloads nor adds backend dependencies to
+including experimental classification and probe coverage, keyed by the shared
+`ContainmentBackend` enum. Runtime authorization consults that registry.
+Exact-contract publication, build-feature availability, and host-capability
+probing remain separate; the registry declares which backends the probe covers
+but neither detects them, dispatches workloads, nor adds backend dependencies to
 `mxc_common`.
 
 ## Request flow
