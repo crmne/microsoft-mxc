@@ -197,6 +197,9 @@ pub use core_modules::mxc_schema_support;
 #[doc(hidden)]
 pub use core_modules::mxc_telemetry;
 #[doc(hidden)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use core_modules::mxc_unix_resources;
+#[doc(hidden)]
 pub use core_modules::plm;
 #[doc(hidden)]
 pub use core_modules::process_security_environment_spec;

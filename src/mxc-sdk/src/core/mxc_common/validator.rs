@@ -174,10 +174,16 @@ impl ResourcePolicySupport {
 
     /// The resource limits `backend` enforces. A backend that enforces any
     /// limit also reports resource usage.
+    ///
+    /// Bubblewrap sets rlimits and a nice value on `bwrap`, which every
+    /// process in the sandbox inherits. It has no per-workload process
+    /// counter: `RLIMIT_NPROC` counts every process of the user.
     pub const fn for_backend(backend: &ContainmentBackend) -> Self {
         match backend {
+            ContainmentBackend::Bubblewrap => {
+                Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::PRIORITY.0)
+            }
             ContainmentBackend::ProcessContainer
-            | ContainmentBackend::Bubblewrap
             | ContainmentBackend::Seatbelt
             | ContainmentBackend::Wslc
             | ContainmentBackend::Lxc
@@ -721,6 +727,18 @@ mod tests {
             );
             assert!(error.error_message.contains("resources is not supported"));
         }
+    }
+
+    #[test]
+    fn bubblewrap_enforces_every_limit_but_max_processes() {
+        let mut resources = every_resource_limit();
+        let request = request_with_resources(ContainmentBackend::Bubblewrap, resources);
+        let error = validate_common(&request).unwrap_err();
+        assert!(error.error_message.contains("resources.maxProcesses"));
+
+        resources.max_processes = None;
+        let request = request_with_resources(ContainmentBackend::Bubblewrap, resources);
+        assert!(validate_common(&request).is_ok());
     }
 
     #[test]
