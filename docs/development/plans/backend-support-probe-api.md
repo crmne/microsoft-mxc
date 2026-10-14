@@ -137,8 +137,8 @@ The detectors for the other previously-missing backends:
 | `isolation_session` | `IsoSessionOps` activates and reports a `LocalAgentUser` feature level above zero | Queries API-class registration rather than a build number (#761); a `CLASS_E_CLASSNOTAVAILABLE` / `REGDB_E_CLASSNOTREG` activation failure means unavailable. |
 | `lxc` | `lxc-ls --version` exits cleanly within a 3s bound | §4.2, step 1. |
 
-`hyperlight` has `is_whp_available()`, which checks the hypervisor without
-booting a VM.
+`hyperlight` has a hypervisor check on each supported host — `is_whp_available()`
+on Windows, `is_kvm_available()` on Linux — neither of which boots a VM.
 
 ### 4.2 The parity rule: detect once, project into TS
 
@@ -196,7 +196,8 @@ Remaining detector and TypeScript-projection work, one issue each. The
 `windows_sandbox`, `isolation_session`, and `lxc` detectors have landed in Rust
 and are registered as `ProbeCoverage::Detected`.
 
-1. `microvm` - hypervisor-presence probe. `hyperlight` has one (`is_whp_available()`); `microvm`
+1. `microvm` - hypervisor-presence probe. `hyperlight` has one per host
+(`is_whp_available()` / `is_kvm_available()`); `microvm`
 is registered as `ProbeCoverage::NotDetected` until its detector lands.
 2. TypeScript projection - make `getPlatformSupport()` read the native backend availability via a
 side-effect-free transport (e.g. a new `wxc-exec --available-backends` mode handled **before**

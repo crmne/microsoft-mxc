@@ -166,6 +166,7 @@ fn linux_backends() -> Vec<AvailableBackend> {
         crate::bwrap_common::bwrap_version::probe_bwrap().is_ok(),
         crate::bwrap_common::proxy_network::probe_proxy_enforcement,
         crate::lxc_common::availability::is_lxc_available(),
+        hyperlight_host_available(),
     )
 }
 
@@ -178,6 +179,7 @@ fn linux_backends_with(
     bwrap_available: bool,
     proxy_enforcement: impl FnOnce() -> Result<(), String>,
     lxc_available: bool,
+    hyperlight_available: bool,
 ) -> Vec<AvailableBackend> {
     let mut backends = Vec::new();
     if bwrap_available {
@@ -186,6 +188,11 @@ fn linux_backends_with(
     if lxc_available {
         backends.push(AvailableBackend::tierless(
             ContainmentBackend::Lxc.wire_name(),
+        ));
+    }
+    if hyperlight_available {
+        backends.push(AvailableBackend::tierless(
+            ContainmentBackend::Hyperlight.wire_name(),
         ));
     }
     backends
@@ -262,12 +269,18 @@ fn isolation_session_host_available() -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
+/// Hyperlight needs x86_64 and a hypervisor: WHP on Windows, KVM on Linux.
+/// Both are checked here so a missing hypervisor never reaches the delay-loaded
+/// WHP import or a VM boot.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn hyperlight_host_available() -> bool {
-    // WHP is delay-loaded; check before setup boots a VM.
-    #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
+    #[cfg(all(feature = "hyperlight", target_arch = "x86_64", target_os = "windows"))]
     {
         crate::hyperlight_common::is_whp_available()
+    }
+    #[cfg(all(feature = "hyperlight", target_arch = "x86_64", target_os = "linux"))]
+    {
+        crate::hyperlight_common::is_kvm_available()
     }
     #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
     {
@@ -394,7 +407,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn backends_with_host_checks_passing() -> Vec<AvailableBackend> {
-        linux_backends_with(true, || Ok(()), true)
+        linux_backends_with(true, || Ok(()), true, true)
     }
 
     #[cfg(target_os = "macos")]

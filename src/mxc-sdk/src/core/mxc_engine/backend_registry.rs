@@ -66,7 +66,7 @@ static BACKENDS: [BackendRegistration; 10] = [
     BackendRegistration {
         backend: ContainmentBackend::Hyperlight,
         experimental: true,
-        probe_coverage: ProbeCoverage::Detected(&["windows"]),
+        probe_coverage: ProbeCoverage::Detected(&["windows", "linux"]),
     },
     BackendRegistration {
         backend: ContainmentBackend::WindowsSandbox,
