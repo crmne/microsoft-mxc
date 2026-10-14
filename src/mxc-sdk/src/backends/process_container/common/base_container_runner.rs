@@ -1513,6 +1513,7 @@ impl BaseContainerSandboxProcess {
                                     .map(|path| path.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                             }),
+                            resource_usage: None,
                         });
                         Err(error)
                     }
@@ -1527,6 +1528,7 @@ impl BaseContainerSandboxProcess {
                                     message: error.to_string(),
                                     etl_path: etl_path.to_string_lossy().into_owned(),
                                 }),
+                                resource_usage: None,
                             });
                         }
                         Err(error)
@@ -1535,6 +1537,7 @@ impl BaseContainerSandboxProcess {
                         self.output_metadata = Some(SandboxOutputMetadata {
                             capture_denials: Some(metadata.clone()),
                             capture_denials_error: None,
+                            resource_usage: None,
                         });
                         Ok(Some(metadata))
                     }
@@ -1543,6 +1546,7 @@ impl BaseContainerSandboxProcess {
                             self.output_metadata = Some(SandboxOutputMetadata {
                                 capture_denials: Some(metadata.clone()),
                                 capture_denials_error: None,
+                                resource_usage: None,
                             });
                         } else if retain_etl && etl_was_sealed {
                             if let Some(etl_path) = etl_path.as_deref() {
@@ -1552,6 +1556,7 @@ impl BaseContainerSandboxProcess {
                                         message: error.to_string(),
                                         etl_path: etl_path.to_string_lossy().into_owned(),
                                     }),
+                                    resource_usage: None,
                                 });
                             }
                         }

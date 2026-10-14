@@ -904,6 +904,7 @@ mod tests {
                     etl_path: None,
                 }),
                 capture_denials_error: None,
+                resource_usage: None,
             }),
             stdout: None,
             release_output: None,
