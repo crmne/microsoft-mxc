@@ -308,7 +308,7 @@ pub mod v1 {
     };
     pub use crate::sandbox::{
         CaptureDenialsError, CaptureDenialsResult, ExecutionMetadata, ExecutionResult, MxcProcess,
-        MxcPtyProcess, MxcPtySize, StreamCloser, WaitResult,
+        MxcPtyProcess, MxcPtySize, ResourceLimit, ResourceUsage, StreamCloser, WaitResult,
     };
     pub use crate::state_aware_sdk::{
         ContainerId, ExecutionRequest, IsolationSessionProvisionMetadata, LifecycleResult,

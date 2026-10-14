@@ -675,11 +675,7 @@ fn seatbelt_resources_json(command: &str, resources: &str) -> String {
 fn run_with_resources(
     command: &str,
     resources: &str,
-) -> (
-    WaitResult,
-    String,
-    Option<mxc_sdk::mxc_common::models::ResourceUsage>,
-) {
+) -> (WaitResult, String, Option<mxc_sdk::v1::ResourceUsage>) {
     use std::io::Read;
 
     let mut proc =
@@ -731,7 +727,7 @@ fn seatbelt_cpu_time_limit_stops_the_workload() {
     let usage = usage.expect("resource usage reported");
     assert_eq!(
         usage.limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+        Some(mxc_sdk::v1::ResourceLimit::CpuTime)
     );
 }
 
@@ -750,7 +746,7 @@ fn seatbelt_cpu_time_limit_stops_a_workload_that_ignores_sigxcpu() {
     );
     assert_eq!(
         usage.expect("resource usage reported").limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+        Some(mxc_sdk::v1::ResourceLimit::CpuTime)
     );
 }
 

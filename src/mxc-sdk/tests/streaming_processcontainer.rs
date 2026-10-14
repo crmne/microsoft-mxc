@@ -117,11 +117,7 @@ fn processcontainer_resources_json(command: &str, resources: &str) -> String {
 fn run_with_resources(
     command: &str,
     resources: &str,
-) -> (
-    WaitResult,
-    String,
-    Option<mxc_sdk::mxc_common::models::ResourceUsage>,
-) {
+) -> (WaitResult, String, Option<mxc_sdk::v1::ResourceUsage>) {
     use std::io::Read;
 
     let mut proc = mxc_sdk::__ffi::spawn_container_json(
@@ -166,7 +162,7 @@ fn processcontainer_cpu_time_limit_stops_the_workload() {
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
     assert_eq!(
         usage.expect("resource usage reported").limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+        Some(mxc_sdk::v1::ResourceLimit::CpuTime)
     );
 }
 
@@ -190,7 +186,7 @@ fn processcontainer_max_processes_refuses_another_process() {
     assert_ne!(outcome, WaitResult::Exited(0));
     assert_eq!(
         usage.expect("resource usage reported").limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::MaxProcesses)
+        Some(mxc_sdk::v1::ResourceLimit::MaxProcesses)
     );
 }
 

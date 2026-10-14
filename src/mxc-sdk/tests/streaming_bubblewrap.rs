@@ -298,11 +298,7 @@ fn bwrap_resources_json(command: &str, resources: &str) -> String {
 fn run_with_resources(
     command: &str,
     resources: &str,
-) -> (
-    WaitResult,
-    String,
-    Option<mxc_sdk::mxc_common::models::ResourceUsage>,
-) {
+) -> (WaitResult, String, Option<mxc_sdk::v1::ResourceUsage>) {
     use std::io::Read;
 
     let mut proc =
@@ -351,9 +347,8 @@ fn streaming_bubblewrap_usage_includes_waited_for_descendants() {
     assert_eq!(outcome, WaitResult::Exited(0));
     let alone = run_with_resources(busy, "{}").2.expect("usage");
     let both = usage.expect("usage");
-    let total = |usage: &mxc_sdk::mxc_common::models::ResourceUsage| {
-        usage.user_cpu_time_us + usage.system_cpu_time_us
-    };
+    let total =
+        |usage: &mxc_sdk::v1::ResourceUsage| usage.user_cpu_time_us + usage.system_cpu_time_us;
     assert!(
         total(&both) > total(&alone) * 3 / 2,
         "two busy children ({both:?}) should cost more than one ({alone:?})"
@@ -373,7 +368,7 @@ fn streaming_bubblewrap_cpu_time_limit_stops_the_workload() {
     let usage = usage.expect("resource usage reported");
     assert_eq!(
         usage.limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+        Some(mxc_sdk::v1::ResourceLimit::CpuTime)
     );
     assert!(usage.user_cpu_time_us + usage.system_cpu_time_us >= 900_000);
 }
@@ -393,7 +388,7 @@ fn streaming_bubblewrap_cpu_time_limit_stops_a_workload_that_ignores_sigxcpu() {
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
     assert_eq!(
         usage.expect("resource usage reported").limit_exceeded,
-        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+        Some(mxc_sdk::v1::ResourceLimit::CpuTime)
     );
 }
 
