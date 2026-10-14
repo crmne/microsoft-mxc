@@ -180,14 +180,16 @@ impl ResourcePolicySupport {
     /// counter: `RLIMIT_NPROC` counts every process of the user. Seatbelt
     /// does the same on the process it launches, but macOS rejects memory
     /// rlimits (`RLIMIT_DATA`, `RLIMIT_AS`, `RLIMIT_RSS`) with `EINVAL`.
+    /// ProcessContainer enforces every limit through the job object its
+    /// workload is assigned to before it is resumed.
     pub const fn for_backend(backend: &ContainmentBackend) -> Self {
         match backend {
             ContainmentBackend::Bubblewrap => {
                 Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::PRIORITY.0)
             }
             ContainmentBackend::Seatbelt => Self(Self::CPU_TIME.0 | Self::PRIORITY.0),
-            ContainmentBackend::ProcessContainer
-            | ContainmentBackend::Wslc
+            ContainmentBackend::ProcessContainer => Self::ALL,
+            ContainmentBackend::Wslc
             | ContainmentBackend::Lxc
             | ContainmentBackend::Vm
             | ContainmentBackend::MicroVm
@@ -757,10 +759,10 @@ mod tests {
     }
 
     #[test]
-    fn full_support_accepts_every_resource_limit() {
+    fn process_container_enforces_every_resource_limit() {
         let request =
             request_with_resources(ContainmentBackend::ProcessContainer, every_resource_limit());
-        assert!(validate_resource_policy_support(&request, ResourcePolicySupport::ALL).is_ok());
+        assert!(validate_common(&request).is_ok());
     }
 
     #[test]

@@ -501,6 +501,10 @@ any process in the workload's session whose CPU time reached the limit. See
 the [Bubblewrap](backends/bwrap/bubblewrap-backend.md#resource-limits) and
 [Seatbelt](backends/seatbelt/seatbelt-backend.md#resource-limits) guides.
 
+On ProcessContainer, MXC sets the limits on the job object the workload is
+assigned to before it resumes, so every descendant is covered. The job counts
+CPU time in user mode only.
+
 Neither Bubblewrap nor Seatbelt can count a workload's processes without a
 per-workload cgroup. `RLIMIT_NPROC` counts every process of the user, including
 ones outside the sandbox, so MXC does not use it.
