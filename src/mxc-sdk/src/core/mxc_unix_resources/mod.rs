@@ -61,6 +61,12 @@ impl UnixResourceLimits {
         self.cpu_seconds
     }
 
+    /// The enforced CPU time limit, in microseconds.
+    pub fn cpu_time_us(&self) -> Option<u64> {
+        self.cpu_seconds
+            .map(|seconds| seconds.saturating_mul(MICROS_PER_SECOND))
+    }
+
     /// Apply the limits to the process `command` spawns, between `fork` and
     /// `exec`. A limit that cannot be applied fails the spawn.
     pub fn apply_to(self, command: &mut Command) {
@@ -255,6 +261,34 @@ pub fn peek_exited_child(pid: u32) -> io::Result<Option<ExitedChild>> {
     }))
 }
 
+/// The CPU time live process `pid` has used itself, excluding its children,
+/// in microseconds. Returns `Ok(None)` when the process no longer exists.
+#[cfg(target_os = "macos")]
+pub fn process_cpu_time_us(pid: libc::pid_t) -> io::Result<Option<u64>> {
+    // SAFETY: a zeroed rusage_info_v2 is a valid initial value.
+    let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a writable rusage_info_v2, the layout RUSAGE_INFO_V2
+    // asks the kernel to fill.
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&mut usage as *mut libc::rusage_info_v2).cast(),
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    let timebase = mach_time::timebase()?;
+    Ok(Some(timebase.micros(
+        usage.ri_user_time.saturating_add(usage.ri_system_time),
+    )))
+}
+
 /// # Safety
 ///
 /// `info` must have been filled by a successful `waitid` call, or zeroed.
@@ -330,6 +364,8 @@ pub struct ChildAccounting {
     /// Set once the child has been reaped: its pid may be reused afterwards,
     /// so it is never peeked at again.
     reaped: bool,
+    /// A limit the backend itself enforced by terminating a process.
+    enforced: Option<ResourceLimit>,
 }
 
 impl ChildAccounting {
@@ -339,7 +375,13 @@ impl ChildAccounting {
             limits,
             exited: None,
             reaped: false,
+            enforced: None,
         }
+    }
+
+    /// Record that the backend terminated a process for exceeding `limit`.
+    pub fn record_enforced(&mut self, limit: ResourceLimit) {
+        self.enforced.get_or_insert(limit);
     }
 
     /// `child.try_wait()`, recording the exited child's usage first.
@@ -398,7 +440,9 @@ impl ChildAccounting {
         let exited = self.exited?;
         let mut usage = exited.usage;
         if natural_exit {
-            usage.limit_exceeded = limit_exceeded(&self.limits, exited.exit, &usage);
+            usage.limit_exceeded = self
+                .enforced
+                .or_else(|| limit_exceeded(&self.limits, exited.exit, &usage));
         }
         Some(SandboxOutputMetadata {
             resource_usage: Some(usage),
@@ -558,7 +602,8 @@ mod tests {
         std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut output).unwrap();
 
         let mut accounting = ChildAccounting::new(limits);
-        let Ok(status) = accounting.reap_with_timeout(&mut child, Some(Duration::from_secs(30))) else {
+        let Ok(status) = accounting.reap_with_timeout(&mut child, Some(Duration::from_secs(30)))
+        else {
             panic!("the child did not exit");
         };
         assert_eq!(status.code(), Some(3));

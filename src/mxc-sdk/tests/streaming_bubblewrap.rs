@@ -379,6 +379,25 @@ fn streaming_bubblewrap_cpu_time_limit_stops_the_workload() {
 }
 
 #[test]
+fn streaming_bubblewrap_cpu_time_limit_stops_a_workload_that_ignores_sigxcpu() {
+    if !bwrap_available() {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let (outcome, _, usage) = run_with_resources(
+        "trap '' XCPU; while :; do :; done",
+        r#"{"cpuTimeMs": 1000}"#,
+    );
+
+    assert_ne!(outcome, WaitResult::Exited(0));
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(
+        usage.expect("resource usage reported").limit_exceeded,
+        Some(mxc_sdk::mxc_common::models::ResourceLimit::CpuTime)
+    );
+}
+
+#[test]
 fn streaming_bubblewrap_cpu_time_limit_is_rounded_up_to_seconds() {
     if !bwrap_available() {
         return;

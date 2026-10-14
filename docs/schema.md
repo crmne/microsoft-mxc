@@ -482,7 +482,7 @@ them rejects any `resources` section.
 
 | Field | Bubblewrap | Seatbelt | ProcessContainer | Other backends |
 |-------|------------|----------|------------------|----------------|
-| `cpuTimeMs` | `RLIMIT_CPU`, rounded up to whole seconds | `RLIMIT_CPU`, rounded up to whole seconds | Job object per-process user-mode time limit | Rejected |
+| `cpuTimeMs` | `RLIMIT_CPU`, rounded up to whole seconds | `RLIMIT_CPU`, rounded up to whole seconds, plus a watchdog | Job object per-process user-mode time limit | Rejected |
 | `memoryMb` | `RLIMIT_DATA` | Rejected: macOS rejects memory rlimits | Job object per-process committed-memory limit | Rejected |
 | `maxProcesses` | Rejected | Rejected | Job object active-process limit | Rejected |
 | `priority` | nice 10 (`low`) or 19 (`idle`) | nice 10 (`low`) or 19 (`idle`) | `BELOW_NORMAL` or `IDLE` priority class | Rejected unless `"normal"` |
@@ -495,7 +495,11 @@ limits further but not raise them. Bubblewrap limits memory with
 counts reservations that are never committed: LibreOffice, JIT runtimes, and
 programs with many threads fail under an `RLIMIT_AS` far above what they
 actually use. `RLIMIT_DATA` covers the heap and private writable mappings
-(Linux 4.7 and later), which is where a runaway allocation lands.
+(Linux 4.7 and later), which is where a runaway allocation lands. macOS answers
+`RLIMIT_CPU` with a `SIGXCPU` that a program can ignore, so Seatbelt also kills
+any process in the workload's session whose CPU time reached the limit. See
+the [Bubblewrap](backends/bwrap/bubblewrap-backend.md#resource-limits) and
+[Seatbelt](backends/seatbelt/seatbelt-backend.md#resource-limits) guides.
 
 Neither Bubblewrap nor Seatbelt can count a workload's processes without a
 per-workload cgroup. `RLIMIT_NPROC` counts every process of the user, including
@@ -509,7 +513,7 @@ ones outside the sandbox, so MXC does not use it.
 | `userCpuTimeUs` | User-mode CPU time of the workload and every descendant it waited for, in microseconds. |
 | `systemCpuTimeUs` | Kernel-mode CPU time, likewise. |
 | `peakMemoryBytes` | Peak memory of the workload's largest process: resident set size on Bubblewrap, committed memory on ProcessContainer. Omitted on Seatbelt, which cannot measure descendants' peak memory without reaping them. |
-| `limitExceeded` | `"cpuTime"`, `"memory"`, or `"maxProcesses"` when the workload ran into that limit and the backend can tell. ProcessContainer reports every limit from job object notifications. Bubblewrap and Seatbelt report `"cpuTime"` when the workload was terminated by `SIGXCPU`, or by `SIGKILL` after using at least the limit; they cannot tell when a program saw an allocation fail. |
+| `limitExceeded` | `"cpuTime"`, `"memory"`, or `"maxProcesses"` when the workload ran into that limit and the backend can tell. ProcessContainer reports every limit from job object notifications. Bubblewrap and Seatbelt report `"cpuTime"` when the workload was terminated by `SIGXCPU`, or by `SIGKILL` after using at least the limit, and Seatbelt also when its watchdog killed a process. A memory limit only makes allocations fail, and neither can tell when a program saw that. |
 
 ### Containment Backends
 
