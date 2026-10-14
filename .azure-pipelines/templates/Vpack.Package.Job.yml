@@ -31,7 +31,7 @@ resources:
       ref: refs/heads/main
   pipelines:
     # Source of the signed wxc binaries. Mirrors the alias used in
-    # 1ES.Release.yml. `trigger: none` because the build-completion
+    # 1ES.Release.Npm.yml. `trigger: none` because the build-completion
     # trigger is configured in the ADO UI.
     - pipeline: MXC
       source: 'MXC-Official-Build'
