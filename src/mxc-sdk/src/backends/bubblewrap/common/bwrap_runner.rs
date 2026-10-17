@@ -42,6 +42,7 @@ use crate::bwrap_common::{
     bwrap_version, network_rules,
     provider_monitor::ProviderMonitor,
     proxy_network,
+    workload_status::WorkloadStatus,
 };
 
 const DNS_PORT: u16 = 53;
@@ -288,7 +289,13 @@ impl BubblewrapScriptRunner {
         // builder emits — an old binary would otherwise fail at spawn time with
         // an opaque "unknown option" error.
         if let Err(err) = probe() {
-            return Err(ScriptResponse::error(&err.to_string()));
+            let mut response = ScriptResponse::error(&err.to_string());
+            // Installed but unusable here: a caller may pick another backend.
+            if err.namespaces_unavailable() {
+                response.failure_phase =
+                    crate::mxc_common::models::FailurePhase::BackendUnavailable;
+            }
+            return Err(response);
         }
         if proxy_only || firewall_enforced {
             // Proxy and firewall are mutually exclusive, so this names the one
@@ -530,6 +537,15 @@ impl BubblewrapScriptRunner {
             denied_files,
             network_mode,
         );
+        // Tells the workload's exit from bwrap failing before it started.
+        let mut workload_status = match WorkloadStatus::new() {
+            Ok(status) => status,
+            Err(error) => {
+                stop_proxy_network(&mut proxy_network, logger);
+                return Err(ScriptResponse::error(&error));
+            }
+        };
+        args.splice(0..0, workload_status.args());
         let mut network_startup = match proxy_network.as_ref() {
             Some(network) => match network.configure_bwrap(&mut args, logger) {
                 Ok(startup) => Some(startup),
@@ -596,6 +612,7 @@ impl BubblewrapScriptRunner {
         if let Some(startup) = network_startup.as_ref() {
             startup.prepare_command(&mut command);
         }
+        workload_status.prepare_command(&mut command);
         // bwrap and everything it starts inherit the rlimits and nice value.
         let resource_limits = request
             .policy
@@ -616,6 +633,7 @@ impl BubblewrapScriptRunner {
                 )));
             }
         };
+        workload_status.child_spawned();
 
         if let Some(mut startup) = network_startup.take() {
             startup.child_spawned();
@@ -697,6 +715,7 @@ impl BubblewrapScriptRunner {
             termination_error: None,
             accounting: resource_limits.map(ChildAccounting::new),
             output_metadata: None,
+            workload_status,
         })
     }
 }
@@ -728,6 +747,8 @@ struct BwrapChild {
     /// Usage accounting, when the request supplied `resources`.
     accounting: Option<ChildAccounting>,
     output_metadata: Option<SandboxOutputMetadata>,
+    /// Whether bwrap reported the workload's exit.
+    workload_status: WorkloadStatus,
 }
 
 impl BwrapChild {
@@ -752,6 +773,17 @@ impl BwrapChild {
             Some(accounting) => accounting.reap_with_timeout(&mut child, Some(timeout)),
             None => wait_with_timeout(&mut child, Some(timeout)),
         }
+    }
+
+    /// The exit code of a `bwrap` that has exited, or the error to report
+    /// instead when it never started the workload.
+    fn workload_exit(&mut self, status: ExitStatus) -> std::io::Result<i32> {
+        if let Some(error) = self.workload_status.setup_failure(status) {
+            self.termination_error = Some(error.clone());
+            return Err(std::io::Error::other(error));
+        }
+        self.finish_accounting(true);
+        Ok(status.code().unwrap_or(-1))
     }
 
     /// Publish the recorded resource usage as output metadata.
@@ -986,8 +1018,7 @@ impl SandboxProcess for BubblewrapSandboxProcess {
             ));
         }
         if let Some(status) = self.inner.try_wait_child()? {
-            self.inner.finish_accounting(true);
-            return Ok(Some(status.code().unwrap_or(-1)));
+            return self.inner.workload_exit(status).map(Some);
         }
         if self
             .inner
@@ -1100,10 +1131,7 @@ impl SandboxProcess for BubblewrapSandboxProcess {
             ))
         } else {
             match self.await_outcome() {
-                BwrapOutcome::Exited(status) => {
-                    self.inner.finish_accounting(true);
-                    Ok(status.code().unwrap_or(-1))
-                }
+                BwrapOutcome::Exited(status) => self.inner.workload_exit(status),
                 BwrapOutcome::ProviderLost => {
                     let _ = self.kill();
                     let _ = self.inner.lock_child().wait();

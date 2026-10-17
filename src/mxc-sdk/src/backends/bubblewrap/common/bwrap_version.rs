@@ -9,6 +9,13 @@
 //! "unknown option" error. This module probes `bwrap --version` once and
 //! reports a precise, actionable reason when the host cannot run the backend.
 //!
+//! A new-enough `bwrap` is still not a working one: it needs unprivileged user
+//! namespaces, which Ubuntu's AppArmor policy, a `user.max_user_namespaces` of
+//! zero, or a container's seccomp profile can take away. So once the version
+//! passes, the probe also starts one sandbox with the namespaces and mounts
+//! every run uses, and reports [`BwrapUnavailable::NamespacesUnavailable`] when
+//! `bwrap` cannot set it up.
+//!
 //! The parsing half is pure (no I/O), so it is unit-tested on every host; only
 //! [`probe_bwrap`] shells out.
 
@@ -171,6 +178,22 @@ pub enum BwrapUnavailable {
     UnrecognizedVersion(String),
     /// `bwrap` is present but predates [`MIN_BWRAP_VERSION`].
     TooOld(BwrapVersion),
+    /// `bwrap` is new enough but could not set up a sandbox: the host does
+    /// not let it create the namespaces every run needs.
+    NamespacesUnavailable {
+        /// Exit status of the probe sandbox, when `bwrap` ran at all.
+        status: Option<i32>,
+        /// What `bwrap` printed, or why the probe could not run.
+        detail: String,
+    },
+}
+
+impl BwrapUnavailable {
+    /// Whether `bwrap` is installed and new enough, but cannot create the
+    /// namespaces its sandbox runs in.
+    pub fn namespaces_unavailable(&self) -> bool {
+        matches!(self, Self::NamespacesUnavailable { .. })
+    }
 }
 
 impl fmt::Display for BwrapUnavailable {
@@ -214,6 +237,29 @@ impl fmt::Display for BwrapUnavailable {
                  required ({MIN_BWRAP_VERSION_REASON}). \
                  Upgrade the bubblewrap package."
             ),
+            Self::NamespacesUnavailable { status, detail } => {
+                write!(
+                    f,
+                    "Bubblewrap (bwrap) cannot create the user, PID, IPC, UTS, and network \
+                     namespaces its sandbox runs in"
+                )?;
+                match status {
+                    Some(code) => write!(f, " (the probe sandbox exited with status {code}")?,
+                    None => write!(f, " (the probe sandbox did not run")?,
+                }
+                if detail.is_empty() {
+                    write!(f, ")")?;
+                } else {
+                    write!(f, ": {detail})")?;
+                }
+                write!(
+                    f,
+                    ". This host blocks unprivileged user namespaces: Ubuntu 23.10 and later \
+                     restrict them with AppArmor (kernel.apparmor_restrict_unprivileged_userns), \
+                     user.max_user_namespaces or kernel.unprivileged_userns_clone can be 0, and \
+                     container runtimes filter them with seccomp. Allow them for bwrap."
+                )
+            }
         }
     }
 }
@@ -275,7 +321,114 @@ fn probe_bwrap_uncached_until(
     deadline: Instant,
     timeout: Duration,
 ) -> Result<BwrapVersion, BwrapUnavailable> {
-    probe_bwrap_uncached_with(|| run_bwrap_version_until(deadline, timeout))
+    let version = probe_bwrap_uncached_with(|| run_bwrap_version_until(deadline, timeout))?;
+    check_namespace_probe(run_namespace_probe_until(deadline, timeout))?;
+    Ok(version)
+}
+
+/// The namespaces and mounts every Bubblewrap sandbox starts with
+/// (`bwrap_command::build_args_classified_with_mode`), around a command that
+/// does nothing. A host that refuses any of them refuses every run, and
+/// without this check `bwrap`'s refusal would reach the caller as the
+/// workload's own exit status 1 (microsoft/mxc#1494).
+const NAMESPACE_PROBE_ARGS: &[&str] = &[
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--unshare-net",
+    "--die-with-parent",
+    "--ro-bind",
+    "/",
+    "/",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--",
+    "true",
+];
+
+/// Start the probe sandbox, within the same deadline as the version probe.
+fn run_namespace_probe_until(
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<ProbeOutput, BwrapUnavailable> {
+    let gate = probe_gate();
+    let Some(gate_permit) = gate.acquire_permit_until(deadline) else {
+        return Err(namespace_probe_failure(format!(
+            "timed out after {}ms",
+            timeout.as_millis()
+        )));
+    };
+
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("bwrap-namespace-probe".to_string())
+        .spawn(move || {
+            let _gate_permit = gate_permit;
+            let mut command = Command::new("bwrap");
+            command.args(NAMESPACE_PROBE_ARGS);
+            let result = match probe_exec::run_bounded(&mut command, deadline) {
+                Ok(captured) => Ok(ProbeOutput {
+                    success: captured.status.success(),
+                    status: captured.status.code(),
+                    stdout: captured.stdout.bytes,
+                    stderr: captured.stderr.bytes,
+                }),
+                Err(probe_exec::ProbeFailure::Spawn(error)) => {
+                    Err(namespace_probe_failure(error.to_string()))
+                }
+                Err(probe_exec::ProbeFailure::TimedOut { .. }) => Err(namespace_probe_failure(
+                    format!("timed out after {}ms", timeout.as_millis()),
+                )),
+                Err(probe_exec::ProbeFailure::Wait { stage, error }) => Err(
+                    namespace_probe_failure(format!("failed while {}: {error}", stage.as_str())),
+                ),
+                Err(probe_exec::ProbeFailure::Internal(detail)) => {
+                    Err(namespace_probe_failure(detail))
+                }
+            };
+            let _ = sender.send(result);
+        });
+    if let Err(error) = worker {
+        return Err(namespace_probe_failure(format!(
+            "failed to start the namespace probe: {error}"
+        )));
+    }
+
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(namespace_probe_failure(format!(
+            "timed out after {}ms",
+            timeout.as_millis()
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(namespace_probe_failure(
+            "the namespace probe worker disconnected".to_string(),
+        )),
+    }
+}
+
+fn namespace_probe_failure(detail: String) -> BwrapUnavailable {
+    BwrapUnavailable::NamespacesUnavailable {
+        status: None,
+        detail,
+    }
+}
+
+/// Judge the probe sandbox. Split out so the verdict is testable without a
+/// host that blocks namespaces.
+fn check_namespace_probe(
+    output: Result<ProbeOutput, BwrapUnavailable>,
+) -> Result<(), BwrapUnavailable> {
+    let output = output?;
+    if output.success {
+        return Ok(());
+    }
+    Err(BwrapUnavailable::NamespacesUnavailable {
+        status: output.status,
+        detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
 }
 
 fn probe_bwrap_uncached_with<F>(run: F) -> Result<BwrapVersion, BwrapUnavailable>
@@ -556,6 +709,41 @@ fn leading_number(component: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_sandbox_that_runs_proves_the_namespaces() {
+        let output = ProbeOutput {
+            success: true,
+            status: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(check_namespace_probe(Ok(output)), Ok(()));
+    }
+
+    #[test]
+    fn a_refused_probe_sandbox_names_the_namespaces_and_what_bwrap_said() {
+        let output = ProbeOutput {
+            success: false,
+            status: Some(1),
+            stdout: Vec::new(),
+            stderr: b"bwrap: setting up uid map: Permission denied\n".to_vec(),
+        };
+        let error = check_namespace_probe(Ok(output)).unwrap_err();
+        assert!(error.namespaces_unavailable());
+        let message = error.to_string();
+        assert!(message.contains("namespaces"), "{message}");
+        assert!(message.contains("status 1"), "{message}");
+        assert!(message.contains("setting up uid map"), "{message}");
+    }
+
+    #[test]
+    fn a_probe_sandbox_that_never_ran_is_still_a_namespace_failure() {
+        let error =
+            check_namespace_probe(Err(namespace_probe_failure("timed out".into()))).unwrap_err();
+        assert!(error.namespaces_unavailable());
+        assert!(!BwrapUnavailable::NotFound.namespaces_unavailable());
+    }
 
     #[test]
     fn parses_standard_version_output() {

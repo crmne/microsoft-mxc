@@ -16,6 +16,7 @@ mod unix_pty_contract;
 
 use mxc_sdk::v1::WaitResult;
 use mxc_sdk::v1::{spawn, ContainerRequest, FilesystemPolicy};
+use serde_json::json;
 
 /// Whether `bwrap` is usable. Reuses the backend's own probe so this gate
 /// cannot drift from the real version check.
@@ -466,5 +467,71 @@ fn streaming_bubblewrap_rejects_max_processes() {
     assert!(
         error.message.contains("resources.maxProcesses"),
         "{error:?}"
+    );
+}
+
+/// A raw `1.1.0-alpha` Bubblewrap request with `fields` merged over the
+/// defaults.
+fn bubblewrap_json(command: &str, fields: serde_json::Value) -> String {
+    let mut request = json!({
+        "version": "1.1.0-alpha",
+        "containment": "bubblewrap",
+        "process": { "commandLine": command, "timeout": 60_000 },
+    });
+    if let (Some(request), Some(fields)) = (request.as_object_mut(), fields.as_object()) {
+        for (key, value) in fields {
+            request.insert(key.clone(), value.clone());
+        }
+    }
+    request.to_string()
+}
+
+/// Where Bubblewrap cannot create its namespaces, a request that names it
+/// fails as a sandbox error instead of reporting bwrap's exit status 1 as the
+/// workload's (microsoft/mxc#1494).
+#[test]
+fn a_named_bubblewrap_without_namespaces_is_a_sandbox_error() {
+    match mxc_sdk::bwrap_common::bwrap_version::probe_bwrap() {
+        Err(error) if error.namespaces_unavailable() => {}
+        other => {
+            println!("SKIPPED: Bubblewrap's namespaces are not blocked here: {other:?}");
+            return;
+        }
+    }
+    let error =
+        mxc_sdk::__ffi::spawn_container_json(&bubblewrap_json("echo ran", json!({})), false)
+            .err()
+            .expect("Bubblewrap cannot run here");
+    assert_eq!(
+        error.code,
+        mxc_sdk::v1::ErrorCode::BackendUnavailable,
+        "{error:?}"
+    );
+    assert!(error.message.contains("namespaces"), "{error:?}");
+}
+
+/// A Bubblewrap sandbox whose setup fails after `bwrap` started, here on a
+/// read-write path that does not exist, is a sandbox error too.
+#[test]
+fn a_bubblewrap_setup_failure_is_not_the_workloads_exit() {
+    if mxc_sdk::bwrap_common::bwrap_version::probe_bwrap().is_err() {
+        println!("SKIPPED: Bubblewrap cannot run here");
+        return;
+    }
+    let missing = "/nonexistent-mxc-bwrap-test/dir";
+    let spawned = mxc_sdk::__ffi::spawn_container_json(
+        &bubblewrap_json(
+            "echo ran",
+            json!({ "filesystem": { "readwritePaths": [missing] } }),
+        ),
+        false,
+    );
+    let mut process = spawned.expect("bwrap starts; its child cannot bind the path");
+    let error = process
+        .wait()
+        .expect_err("bwrap's failure is not an exit code");
+    assert!(
+        error.to_string().contains("never started the workload"),
+        "{error}"
     );
 }

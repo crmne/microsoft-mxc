@@ -48,6 +48,18 @@ requiring root privileges or a container runtime.
   so a changed PATH target cannot reuse an advisory result. The Node SDK caches
   the complete `getPlatformSupport()` result, including failures, for the module
   lifetime; restart the Node process after remediating the host.
+- **Unprivileged user namespaces.** The same probe then starts one sandbox
+  with the namespaces and mounts every run uses (`--unshare-user`, `-pid`,
+  `-ipc`, `-uts`, `-net`, `--proc /proc`, `--dev /dev`). A host that refuses
+  them (Ubuntu 23.10 and later with AppArmor's
+  `kernel.apparmor_restrict_unprivileged_userns=1`,
+  `user.max_user_namespaces=0`, or a container's seccomp profile) reports the
+  backend unavailable with `bwrap`'s message, and a request fails validation
+  with it (`backend_unavailable`).
+  A sandbox whose setup fails after `bwrap` started (a mount it cannot make)
+  is reported as an error from `wait`, never as the workload's exit status:
+  the runner passes `--json-status-fd` and treats a `bwrap` that exited without
+  an `exit-code` document as one that never started the workload.
 - **Network-enabled private-namespace modes (v0.9+):** `slirp4netns` installed
   and on PATH, plus util-linux `unshare` (with `--map-current-user` and
   `--keep-caps`), `nsenter`, `iptables`, `ip6tables`, `iptables-restore`, and

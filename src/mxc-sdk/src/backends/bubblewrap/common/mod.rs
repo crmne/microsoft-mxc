@@ -32,3 +32,6 @@ pub(crate) mod provider_monitor;
 /// crate; every other item stays `pub(crate)`.
 #[cfg(target_os = "linux")]
 pub mod proxy_network;
+/// Tells the workload's exit from `bwrap` failing to set the sandbox up.
+#[cfg(target_os = "linux")]
+pub(crate) mod workload_status;
