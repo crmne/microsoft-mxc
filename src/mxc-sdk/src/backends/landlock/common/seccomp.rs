@@ -23,6 +23,18 @@
 //!   workload shares with its caller.
 //! - System calls of another ABI (32-bit `int 0x80` or x32 on x86_64), whose
 //!   numbers and socket multiplexer the filter does not check.
+//! - Permission, ownership, timestamp, and extended attribute changes by path
+//!   (`chmod`, `fchmodat`, `chown`, `fchownat`, `utimensat` with a path,
+//!   `setxattr`, and the rest of their families). Landlock does not govern
+//!   metadata, so without this a workload could change any file the user
+//!   owns, even one outside every grant: make a private key readable to other
+//!   users, say. A read-only bind mount refuses these under Bubblewrap. The
+//!   same changes through a file descriptor (`fchmod`, `fchown`, `futimens`,
+//!   `fsetxattr`) stay allowed: they need a file the workload could open,
+//!   which Landlock already decided, and the kernel refuses them on `O_PATH`
+//!   descriptors. So a workload cannot `chmod +x` or `touch` a file by name,
+//!   even one it may write; it sets the mode when it creates the file, or
+//!   changes it through an open descriptor.
 //!
 //! The filter is classic BPF built here and installed between `fork` and
 //! `exec`, after `no_new_privs`.
@@ -71,6 +83,16 @@ mod filter {
     const fn offset_arg_low(index: u32) -> u32 {
         16 + 8 * index
     }
+    /// The high 32 bits of a 64-bit argument (a pointer), little-endian.
+    const fn offset_arg_high(index: u32) -> u32 {
+        offset_arg_low(index) + 4
+    }
+
+    // Numbered alike on every architecture from 424 on; not every `libc`
+    // version names them.
+    const SYS_FCHMODAT2: libc::c_long = 452;
+    const SYS_SETXATTRAT: libc::c_long = 463;
+    const SYS_REMOVEXATTRAT: libc::c_long = 466;
 
     const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     const BPF_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
@@ -147,6 +169,45 @@ mod filter {
         ]
     }
 
+    /// Metadata changes by path, which Landlock does not govern. The
+    /// descriptor-based calls (`fchmod`, `fchown`, `fsetxattr`,
+    /// `fremovexattr`) are left alone.
+    fn metadata_by_path() -> Vec<libc::c_long> {
+        let mut calls = vec![
+            libc::SYS_fchmodat,
+            SYS_FCHMODAT2,
+            libc::SYS_fchownat,
+            libc::SYS_setxattr,
+            libc::SYS_lsetxattr,
+            SYS_SETXATTRAT,
+            libc::SYS_removexattr,
+            libc::SYS_lremovexattr,
+            SYS_REMOVEXATTRAT,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        calls.extend([
+            libc::SYS_chmod,
+            libc::SYS_chown,
+            libc::SYS_lchown,
+            libc::SYS_utime,
+            libc::SYS_utimes,
+            libc::SYS_futimesat,
+        ]);
+        calls
+    }
+
+    /// `utimensat(dirfd, path, times, flags)`: allowed only without a path,
+    /// which is `futimens(fd)` on the descriptor itself.
+    fn utimensat_block() -> Vec<libc::sock_filter> {
+        let mut without_path = vec![load(offset_arg_high(1))];
+        without_path.extend(when(0, vec![allow()]));
+        without_path.push(fail(libc::EPERM));
+        let mut block = vec![load(offset_arg_low(1))];
+        block.extend(when(0, without_path));
+        block.push(fail(libc::EPERM));
+        block
+    }
+
     fn socket_block(policy: SocketPolicy) -> Vec<libc::sock_filter> {
         let mut block = vec![load(offset_arg_low(0))];
         block.extend(when(
@@ -201,6 +262,10 @@ mod filter {
         for (syscall, errno) in refused() {
             program.extend(when(nr(syscall), vec![fail(errno)]));
         }
+        for syscall in metadata_by_path() {
+            program.extend(when(nr(syscall), vec![fail(libc::EPERM)]));
+        }
+        program.extend(when(nr(libc::SYS_utimensat), utimensat_block()));
         program.extend(when(nr(libc::SYS_socket), socket_block(policy)));
         program.extend(when(nr(libc::SYS_socketpair), socketpair_block(policy)));
         program.extend(when(nr(libc::SYS_ioctl), ioctl_block()));
@@ -260,6 +325,9 @@ mod filter {
                     OFFSET_ARCH => self.arch,
                     offset if offset >= 16 && (offset - 16) % 8 == 0 => {
                         self.args[((offset - 16) / 8) as usize] as u32
+                    }
+                    offset if offset >= 20 && (offset - 20) % 8 == 0 => {
+                        (self.args[((offset - 20) / 8) as usize] >> 32) as u32
                     }
                     other => panic!("unexpected load offset {other}"),
                 }
@@ -506,6 +574,63 @@ mod tests {
             libc::SYS_kill,
         ] {
             assert_eq!(verdict(ISOLATED_OLD_KERNEL, Call::native(nr, &[])), ALLOW);
+        }
+    }
+
+    #[test]
+    fn metadata_changes_by_path_are_refused() {
+        let mut by_path = vec![
+            libc::SYS_fchmodat,
+            452, // fchmodat2
+            libc::SYS_fchownat,
+            libc::SYS_setxattr,
+            libc::SYS_lsetxattr,
+            463, // setxattrat
+            libc::SYS_removexattr,
+            libc::SYS_lremovexattr,
+            466, // removexattrat
+        ];
+        #[cfg(target_arch = "x86_64")]
+        by_path.extend([
+            libc::SYS_chmod,
+            libc::SYS_chown,
+            libc::SYS_lchown,
+            libc::SYS_utime,
+            libc::SYS_utimes,
+            libc::SYS_futimesat,
+        ]);
+        for nr in by_path {
+            assert_eq!(
+                verdict(HOST_NETWORK, Call::native(nr, &[3, 0x7fff_0000_1000])),
+                errno(libc::EPERM),
+                "system call {nr}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_changes_through_a_descriptor_pass() {
+        for nr in [
+            libc::SYS_fchmod,
+            libc::SYS_fchown,
+            libc::SYS_fsetxattr,
+            libc::SYS_fremovexattr,
+        ] {
+            assert_eq!(verdict(ISOLATED, Call::native(nr, &[3, 0o644])), ALLOW);
+        }
+    }
+
+    #[test]
+    fn utimensat_passes_only_without_a_path() {
+        let utimensat = |path: u64| Call::native(libc::SYS_utimensat, &[3, path, 0, 0]);
+        // futimens(fd, times)
+        assert_eq!(verdict(ISOLATED, utimensat(0)), ALLOW);
+        for path in [0x7fff_0000_1000, 0x1000, 0x7fff_0000_0000] {
+            assert_eq!(
+                verdict(ISOLATED, utimensat(path)),
+                errno(libc::EPERM),
+                "path {path:#x}"
+            );
         }
     }
 

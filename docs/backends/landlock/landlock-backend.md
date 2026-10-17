@@ -157,6 +157,13 @@ of its own, so a workload cannot listen on `127.0.0.1` even for itself.
 | `keyctl`, `add_key`, `request_key` | `EPERM` | The caller's session keyring |
 | `ioctl(TIOCSTI)`, `ioctl(TIOCLINUX)` | `EPERM` | Pushing input into a terminal shared with the caller |
 | Any 32-bit or x32 system call | `ENOSYS` | Their numbers and socket multiplexer are not checked |
+| Metadata changes by path: `chmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchownat`, `utime`, `utimes`, `futimesat`, `utimensat` with a path, `setxattr`, `lsetxattr`, `setxattrat`, `removexattr`, `lremovexattr`, `removexattrat` | `EPERM` | Landlock does not govern metadata, so a workload could otherwise change the mode, owner, timestamps, or extended attributes of any file the user owns, even one outside every grant. A read-only bind mount refuses them under Bubblewrap |
+
+The descriptor-based calls (`fchmod`, `fchown`, `futimens`, which is
+`utimensat` without a path, `fsetxattr`, `fremovexattr`) stay allowed. They
+need a descriptor of a file the workload could open, which Landlock already
+decided; the kernel refuses them on `O_PATH` descriptors, which Landlock does
+not check.
 
 ### Resource limits
 
@@ -214,5 +221,11 @@ and that `"bubblewrap"` fails as a sandbox error.
 - No address-aware networking: no egress rules, no proxy-only egress, and no
   outbound access without the host loopback.
 - No carve-outs inside policy grants.
+- No metadata changes by path, even in read-write paths: `chmod +x file`,
+  `touch existing-file`, `chown`, and `setfattr` fail with `EPERM`. Set the
+  mode when creating a file (`open` with a mode, as compilers and `install`
+  do), or change it through an open descriptor (`fchmod`, `futimens`).
+  `touch` on a file the workload can open for writing works, since it changes
+  the times through the descriptor; `touch` of a new file works too.
 - The workload sees the host's `/proc` and, below ABI 6, can signal the user's
   other processes.

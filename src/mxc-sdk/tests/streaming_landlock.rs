@@ -204,6 +204,90 @@ fn landlock_grants_exactly_the_policy_paths() {
     );
 }
 
+/// Landlock does not govern metadata, so the filter refuses changes by
+/// path: a workload cannot make a file it may not read readable to others.
+#[test]
+fn landlock_refuses_metadata_changes_by_path() {
+    if !landlock_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let rw = root.path().join("rw");
+    let outside = root.path().join("outside");
+    for dir in [&rw, &outside] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let key = outside.join("key");
+    std::fs::write(&key, "secret\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mtime = std::fs::metadata(&key).unwrap().modified().unwrap();
+    std::fs::write(rw.join("own"), "mine\n").unwrap();
+
+    let script = format!(
+        "chmod 644 {key} 2>/dev/null || echo chmod-denied; \
+         chown $(id -u) {key} 2>/dev/null || echo chown-denied; \
+         touch -d 2001-01-01 {key} 2>/dev/null || echo touch-denied; \
+         chmod +x {rw}/own 2>/dev/null || echo own-chmod-denied; \
+         touch -d 2001-01-01 {rw}/own && echo own-touch-ok; \
+         touch {rw}/new && echo new-touch-ok",
+        key = path(&key),
+        rw = path(&rw),
+    );
+    let result = run(
+        &script,
+        serde_json::json!({ "filesystem": { "readwritePaths": [path(&rw)] } }),
+    );
+    assert_eq!(result.outcome, WaitResult::Exited(0), "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "chmod-denied\nchown-denied\ntouch-denied\nown-chmod-denied\nown-touch-ok\nnew-touch-ok\n"
+    );
+    let metadata = std::fs::metadata(&key).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(metadata.modified().unwrap(), mtime);
+
+    if !python3() {
+        return;
+    }
+    // Through a descriptor it opened, a workload still sets its own files'
+    // mode and times; an O_PATH descriptor of a file it may not open does
+    // not count.
+    let script = format!(
+        "import os\n\
+         fd = os.open('{rw}/own', os.O_WRONLY)\n\
+         os.fchmod(fd, 0o755); os.utime(fd, (0, 0))\n\
+         print('fd-ok', oct(os.stat('{rw}/own').st_mode & 0o777))\n\
+         ref = os.open('{key}', os.O_PATH)\n\
+         for change in (lambda: os.fchmod(ref, 0o644), lambda: os.utime(ref, (0, 0))):\n\
+         \x20   try:\n\
+         \x20       change(); print('O_PATH-CHANGED')\n\
+         \x20   except OSError:\n\
+         \x20       print('o-path-denied')\n",
+        rw = path(&rw),
+        key = path(&key),
+    );
+    // The script goes in the environment, so the shell leaves it alone.
+    let command = "python3 -c \"$SCRIPT\"";
+    let result = run(
+        command,
+        serde_json::json!({
+            "filesystem": { "readwritePaths": [path(&rw)] },
+            "process": {
+                "commandLine": command,
+                "timeout": 60_000,
+                "env": [format!("SCRIPT={script}")],
+            },
+        }),
+    );
+    assert_eq!(result.outcome, WaitResult::Exited(0), "{}", result.stderr);
+    assert_eq!(result.stdout, "fd-ok 0o755\no-path-denied\no-path-denied\n");
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn landlock_hides_the_callers_home_and_tmp() {
     if !landlock_available() {
