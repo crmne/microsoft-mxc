@@ -100,7 +100,9 @@ impl WorkloadStatus {
         }
         Some(format!(
             "Bubblewrap: bwrap could not set up the sandbox and never started the workload \
-             (bwrap exited with status {code}; its message is on the run's stderr)."
+             (bwrap exited with status {code}; its message is on the run's stderr). If it \
+             could not create namespaces, this host blocks unprivileged user namespaces, and \
+             containment \"process\" or \"landlock\" runs on Landlock instead."
         ))
     }
 

@@ -68,11 +68,16 @@ struct ProxyEnforcementProbe<G>(G);
 #[cfg(target_os = "linux")]
 struct LxcProbe<H>(H);
 
+/// The Landlock ABI query, injected for the same reason.
 #[cfg(target_os = "linux")]
-fn linux_platform_support_with<F, G, H>(
+struct LandlockProbe<L>(L);
+
+#[cfg(target_os = "linux")]
+fn linux_platform_support_with<F, G, H, L>(
     lxc: LxcProbe<H>,
     bwrap: BwrapProbe<F>,
     proxy_enforcement: ProxyEnforcementProbe<G>,
+    landlock: LandlockProbe<L>,
 ) -> PlatformSupport
 where
     F: FnOnce() -> Result<
@@ -81,18 +86,27 @@ where
     >,
     G: FnOnce() -> Result<(), String>,
     H: FnOnce() -> bool,
+    L: FnOnce() -> Result<
+        crate::landlock_common::abi::LandlockAbi,
+        crate::landlock_common::abi::LandlockUnavailable,
+    >,
 {
     let lxc_available = (lxc.0)();
     let bwrap_probe = (bwrap.0)();
+    let landlock_probe = (landlock.0)();
 
     // Listed in the TypeScript SDK's order, so a caller moving off
-    // `getPlatformSupport` reads the same answer.
+    // `getPlatformSupport` reads the same answer. Landlock, which that SDK
+    // does not know, comes last.
     let mut available_methods = Vec::new();
     if lxc_available {
         available_methods.push("lxc".to_string());
     }
     if bwrap_probe.is_ok() {
         available_methods.push("bubblewrap".to_string());
+    }
+    if landlock_probe.is_ok() {
+        available_methods.push("landlock".to_string());
     }
 
     match bwrap_probe {
@@ -105,16 +119,20 @@ where
             bubblewrap_network: Some(bubblewrap_network_support((proxy_enforcement.0)())),
             ..Default::default()
         },
-        // `reason` says why the platform is unsupported, and LXC alone makes it
-        // supported, so the bwrap detail has nowhere to go here.
-        Err(_) if lxc_available => PlatformSupport {
+        // `reason` says why the platform is unsupported, and LXC or Landlock
+        // alone makes it supported, so the bwrap detail has nowhere to go here.
+        Err(_) if lxc_available || landlock_probe.is_ok() => PlatformSupport {
             is_supported: true,
             available_methods,
             ..Default::default()
         },
         Err(err) => PlatformSupport {
             reason: Some(format!(
-                "Neither LXC nor Bubblewrap is available on this system ({err})"
+                "Neither LXC, Bubblewrap, nor Landlock is available on this system ({err} {})",
+                landlock_probe
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
             )),
             ..Default::default()
         },
@@ -124,8 +142,9 @@ where
 /// Detect MXC support on the current host.
 ///
 /// Mirrors the SDK's `getPlatformSupport`, restricted to the backends the
-/// `mxc-sdk` library can actually run. On Linux both `bubblewrap` and `lxc` are
-/// reported when present, and either one alone makes the host supported. On
+/// `mxc-sdk` library can actually run. On Linux `lxc`, `bubblewrap`, and
+/// `landlock` are reported when usable, and any one alone makes the host
+/// supported. `bubblewrap` is usable only where it can create its namespaces. On
 /// Windows the isolation tier and UI capabilities come from the in-process
 /// fallback probe rather than a `wxc-exec --probe` subprocess, and `wslc` is
 /// reported when the host has the WSL Container runtime (requires the `wslc`
@@ -160,10 +179,15 @@ pub fn platform_support() -> PlatformSupport {
         // for every flag the argument builder emits (see
         // `crate::bwrap_common::bwrap_version::MIN_BWRAP_VERSION`). LXC has no such
         // floor, so a clean `lxc-ls --version` is its whole gate.
+        //
+        // The Bubblewrap probe also starts one sandbox, so a host that blocks
+        // unprivileged user namespaces reports Bubblewrap unavailable rather
+        // than failing every run (microsoft/mxc#1494).
         linux_platform_support_with(
             LxcProbe(crate::lxc_common::availability::is_lxc_available),
             BwrapProbe(crate::bwrap_common::bwrap_version::probe_bwrap),
             ProxyEnforcementProbe(crate::bwrap_common::proxy_network::probe_proxy_enforcement),
+            LandlockProbe(crate::landlock_common::abi::probe),
         )
     }
 
@@ -265,10 +289,13 @@ mod tests {
     use super::platform_support;
     #[cfg(target_os = "linux")]
     use super::{
-        bubblewrap_network_support, BwrapProbe, LxcProbe, ProxyEnforcement, ProxyEnforcementProbe,
+        bubblewrap_network_support, BwrapProbe, LandlockProbe, LxcProbe, ProxyEnforcement,
+        ProxyEnforcementProbe,
     };
     #[cfg(target_os = "linux")]
     use crate::bwrap_common::bwrap_version::{BwrapUnavailable, BwrapVersion, MIN_BWRAP_VERSION};
+    #[cfg(target_os = "linux")]
+    use crate::landlock_common::abi::{LandlockAbi, LandlockUnavailable};
     use crate::mxc_common::models::ContainmentBackend;
 
     const CANONICAL_BACKEND_NAMES: &[(ContainmentBackend, &str)] = &[
@@ -282,6 +309,7 @@ mod tests {
         (ContainmentBackend::IsolationSession, "isolation_session"),
         (ContainmentBackend::Seatbelt, "seatbelt"),
         (ContainmentBackend::Bubblewrap, "bubblewrap"),
+        (ContainmentBackend::Landlock, "landlock"),
     ];
 
     #[cfg(target_os = "linux")]
@@ -356,6 +384,7 @@ mod tests {
             LxcProbe(|| false),
             BwrapProbe(|| Ok(MIN_BWRAP_VERSION)),
             ProxyEnforcementProbe(|| Ok(())),
+            LandlockProbe(|| Err(LandlockUnavailable::NotImplemented)),
         );
         assert!(support.is_supported);
         assert_eq!(support.reason, None);
@@ -378,6 +407,7 @@ mod tests {
             LxcProbe(|| true),
             BwrapProbe(|| Ok(MIN_BWRAP_VERSION)),
             ProxyEnforcementProbe(|| Ok(())),
+            LandlockProbe(|| Err(LandlockUnavailable::NotImplemented)),
         );
         assert!(support.is_supported);
         assert_eq!(support.available_methods, ["lxc", "bubblewrap"]);
@@ -394,6 +424,7 @@ mod tests {
             ProxyEnforcementProbe(|| {
                 panic!("the network walk must not run without a usable bwrap")
             }),
+            LandlockProbe(|| Err(LandlockUnavailable::NotImplemented)),
         );
         assert!(support.is_supported);
         assert_eq!(support.reason, None);
@@ -412,6 +443,7 @@ mod tests {
             ProxyEnforcementProbe(|| {
                 panic!("the network walk must not run without a usable bwrap")
             }),
+            LandlockProbe(|| Err(LandlockUnavailable::NotImplemented)),
         );
         assert!(!support.is_supported);
         let reason = support.reason.expect("an unsupported host explains itself");
@@ -419,6 +451,60 @@ mod tests {
         assert!(reason.contains("LXC"), "got: {reason}");
         assert!(support.available_methods.is_empty());
         assert!(support.bubblewrap_network.is_none());
+    }
+
+    /// A host that blocks the namespaces Bubblewrap needs still runs sandboxes
+    /// on Landlock, and the reason the namespaces failed is not lost to a
+    /// caller that asks for Bubblewrap by name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_support_stands_on_landlock_when_namespaces_are_blocked() {
+        let support = linux_platform_support_with(
+            LxcProbe(|| false),
+            BwrapProbe(|| {
+                Err(BwrapUnavailable::NamespacesUnavailable {
+                    status: Some(1),
+                    detail: "bwrap: setting up uid map: Permission denied".to_string(),
+                })
+            }),
+            ProxyEnforcementProbe(|| {
+                panic!("the network walk must not run without a usable bwrap")
+            }),
+            LandlockProbe(|| Ok(LandlockAbi::for_tests(4))),
+        );
+        assert!(support.is_supported);
+        assert_eq!(support.reason, None);
+        assert_eq!(support.available_methods, ["landlock"]);
+        assert!(support.bubblewrap_network.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_support_lists_landlock_after_bubblewrap() {
+        let support = linux_platform_support_with(
+            LxcProbe(|| false),
+            BwrapProbe(|| Ok(MIN_BWRAP_VERSION)),
+            ProxyEnforcementProbe(|| Ok(())),
+            LandlockProbe(|| Ok(LandlockAbi::for_tests(9))),
+        );
+        assert_eq!(support.available_methods, ["bubblewrap", "landlock"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_support_without_any_backend_names_every_reason() {
+        let support = linux_platform_support_with(
+            LxcProbe(|| false),
+            BwrapProbe(|| Err(BwrapUnavailable::NotFound)),
+            ProxyEnforcementProbe(|| {
+                panic!("the network walk must not run without a usable bwrap")
+            }),
+            LandlockProbe(|| Err(LandlockUnavailable::TooOld(2))),
+        );
+        assert!(!support.is_supported);
+        let reason = support.reason.expect("an unsupported host explains itself");
+        assert!(reason.contains("not installed"), "{reason}");
+        assert!(reason.contains("ABI 2"), "{reason}");
     }
 
     /// A host with `bwrap` but without the private-network tooling is still a
@@ -430,6 +516,7 @@ mod tests {
             LxcProbe(|| false),
             BwrapProbe(|| Ok(MIN_BWRAP_VERSION)),
             ProxyEnforcementProbe(|| Err("slirp4netns not found".to_string())),
+            LandlockProbe(|| Err(LandlockUnavailable::NotImplemented)),
         );
         assert!(support.is_supported);
         assert_eq!(support.available_methods, ["bubblewrap"]);

@@ -43,6 +43,10 @@ string_enum! {
         Wslc => ["wslc"],
         /// Select the Windows IsolationSession backend.
         IsolationSession => ["isolation_session"],
+
+        // Development-only values introduced in `1.1.0-alpha`.
+        /// Select the Linux Landlock backend.
+        Landlock => ["landlock"],
     }
 }
 

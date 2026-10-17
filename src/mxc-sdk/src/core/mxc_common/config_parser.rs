@@ -1210,6 +1210,7 @@ fn requested_sandbox_kind(c: Option<&wire::Containment>) -> &'static str {
         Some(wire::Containment::Seatbelt) => "seatbelt",
         Some(wire::Containment::IsolationSession) => "isolation_session",
         Some(wire::Containment::Bubblewrap) => "bubblewrap",
+        Some(wire::Containment::Landlock) => "landlock",
     }
 }
 
@@ -1342,6 +1343,7 @@ fn normalize_common_request_ir(
     // value to a known variant (invalid strings fail at deserialize); abstract
     // intents and the omitted case resolve to the OS-native backend here.
     let containment = map_wire_containment(cfg.containment.as_ref());
+    let process_intent = matches!(cfg.containment, None | Some(wire::Containment::Process));
 
     validate_single_backend_section(containment.clone(), &present_backend_sections)?;
 
@@ -1618,6 +1620,7 @@ fn normalize_common_request_ir(
         working_directory,
         script_timeout,
         containment,
+        process_intent,
         lifecycle,
         policy,
         lxc_config,

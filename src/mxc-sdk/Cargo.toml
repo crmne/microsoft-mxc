@@ -88,6 +88,9 @@ flate2 = { version = "1", optional = true }
 hyperlight-unikraft = { version = "=0.17.0", default-features = false, optional = true }
 ureq = { version = "3", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 tracelogging.workspace = true
 windows = { workspace = true, features = [

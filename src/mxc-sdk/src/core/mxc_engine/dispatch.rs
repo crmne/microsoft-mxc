@@ -66,6 +66,10 @@ pub fn spawn_runner(
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    let selected = crate::mxc_engine::host_fallback::select(request, logger);
+    #[cfg(target_os = "linux")]
+    let request = selected.as_ref();
     // Anchor the run to its policy identity before any backend is engaged, so
     // the streaming surface produces the same `mxc.PolicyHash` record as the
     // run-to-completion one.
@@ -73,6 +77,9 @@ pub fn spawn_runner(
     match &request.containment {
         ContainmentBackend::Seatbelt => spawn_seatbelt(request, logger),
         ContainmentBackend::Bubblewrap => spawn_bubblewrap(request, logger),
+        ContainmentBackend::Landlock => {
+            spawn_landlock_with_stdio(request, logger, StdioMode::Pipes)
+        }
         ContainmentBackend::Lxc => spawn_lxc(request, logger),
         ContainmentBackend::ProcessContainer => spawn_process_container(request, logger),
         ContainmentBackend::Wslc => spawn_wslc(request, logger),
@@ -97,11 +104,18 @@ pub fn spawn_pty_runner(
             "dry_run is not supported for PTY spawns",
         ));
     }
+    #[cfg(target_os = "linux")]
+    let selected = crate::mxc_engine::host_fallback::select(request, logger);
+    #[cfg(target_os = "linux")]
+    let request = selected.as_ref();
     crate::mxc_engine::run::log_policy_hash(request, logger);
     match &request.containment {
         ContainmentBackend::IsolationSession => spawn_isolation_session_pty(request, logger, size),
         ContainmentBackend::Bubblewrap => {
             spawn_bubblewrap_with_stdio(request, logger, StdioMode::Pty(size))
+        }
+        ContainmentBackend::Landlock => {
+            spawn_landlock_with_stdio(request, logger, StdioMode::Pty(size))
         }
         ContainmentBackend::Seatbelt => {
             spawn_seatbelt_with_stdio(request, logger, StdioMode::Pty(size))
@@ -177,6 +191,30 @@ fn spawn_bubblewrap_with_stdio(
 ) -> Result<Box<dyn SandboxProcess>, MxcError> {
     Err(MxcError::unsupported_containment(
         "Bubblewrap is only available on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_landlock_with_stdio(
+    request: &ExecutionRequest,
+    logger: &mut Logger,
+    stdio: StdioMode,
+) -> Result<Box<dyn SandboxProcess>, MxcError> {
+    use crate::mxc_common::sandbox_process::SandboxBackend;
+    let mut runner = crate::landlock_common::landlock_runner::LandlockScriptRunner::new();
+    runner
+        .spawn(request, logger, stdio)
+        .map_err(map_spawn_error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_landlock_with_stdio(
+    _request: &ExecutionRequest,
+    _logger: &mut Logger,
+    _stdio: StdioMode,
+) -> Result<Box<dyn SandboxProcess>, MxcError> {
+    Err(MxcError::unsupported_containment(
+        "Landlock is only available on Linux",
     ))
 }
 

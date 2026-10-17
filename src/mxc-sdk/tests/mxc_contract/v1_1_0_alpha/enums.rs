@@ -18,6 +18,7 @@ fn accepts_every_containment_value() {
         "hyperlight",
         "isolation_session",
         "wslc",
+        "landlock",
     ] {
         let json = format!(
             r#"{{

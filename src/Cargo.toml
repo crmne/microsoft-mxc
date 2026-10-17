@@ -41,6 +41,8 @@ cidr = "0.3.2"
 clap = { version = "4", features = ["derive"] }
 flatbuffers = "25"
 getrandom = "0.2"
+# Landlock LSM rulesets for the Linux Landlock backend (Linux-only).
+landlock = "0.4.7"
 libc = "0.2"
 mxc-sdk = { path = "mxc-sdk" }
 nix = { version = "0.29", features = ["fs", "mount", "sched", "signal", "net", "process", "user", "term"] }

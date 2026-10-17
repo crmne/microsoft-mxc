@@ -43,7 +43,7 @@ mod tests {
         ContainmentBackend::WindowsSandbox,
     ];
 
-    const PRODUCTION: [ContainmentBackend; 7] = [
+    const PRODUCTION: [ContainmentBackend; 8] = [
         ContainmentBackend::ProcessContainer,
         ContainmentBackend::Wslc,
         ContainmentBackend::Lxc,
@@ -51,6 +51,7 @@ mod tests {
         ContainmentBackend::IsolationSession,
         ContainmentBackend::Seatbelt,
         ContainmentBackend::Bubblewrap,
+        ContainmentBackend::Landlock,
     ];
 
     #[test]

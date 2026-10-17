@@ -156,7 +156,18 @@ fn linux_backends() -> Vec<AvailableBackend> {
             ContainmentBackend::Lxc.wire_name(),
         ));
     }
+    if let Ok(abi) = crate::landlock_common::abi::probe() {
+        backends.push(landlock_backend(abi));
+    }
     backends
+}
+
+/// Landlock, with what its ABI cannot do that Bubblewrap would as warnings.
+#[cfg(target_os = "linux")]
+fn landlock_backend(abi: crate::landlock_common::abi::LandlockAbi) -> AvailableBackend {
+    let mut backend = AvailableBackend::tierless(ContainmentBackend::Landlock.wire_name());
+    backend.warnings = abi.gaps();
+    backend
 }
 
 /// Split from [`linux_backends`] so the reporting is testable without a host
@@ -299,6 +310,7 @@ mod tests {
         (ContainmentBackend::IsolationSession, "isolation_session"),
         (ContainmentBackend::Seatbelt, "seatbelt"),
         (ContainmentBackend::Bubblewrap, "bubblewrap"),
+        (ContainmentBackend::Landlock, "landlock"),
     ];
 
     fn all_containment_names() -> Vec<String> {
@@ -381,6 +393,20 @@ mod tests {
         assert_eq!(
             json,
             r#"{"backend":"bubblewrap","warnings":["slirp4netns not found"]}"#
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_reports_what_its_abi_leaves_unconfined() {
+        use crate::landlock_common::abi::LandlockAbi;
+        let older = landlock_backend(LandlockAbi::for_tests(4));
+        assert_eq!(older.backend, "landlock");
+        assert_eq!(older.warnings.len(), 2);
+        let current = landlock_backend(LandlockAbi::for_tests(9));
+        assert_eq!(
+            serde_json::to_string(&current).expect("serializes"),
+            r#"{"backend":"landlock"}"#
         );
     }
 

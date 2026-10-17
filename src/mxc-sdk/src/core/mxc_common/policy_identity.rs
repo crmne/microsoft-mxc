@@ -211,6 +211,8 @@ fn policy_projection(request: &ExecutionRequest) -> Value {
         working_directory,
         script_timeout,
         containment,
+        // How the backend was chosen; the backend itself is projected.
+        process_intent: _excluded_process_intent,
         lifecycle,
         policy,
         lxc_config,

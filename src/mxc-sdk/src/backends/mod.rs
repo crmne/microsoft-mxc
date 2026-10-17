@@ -21,6 +21,11 @@ pub mod lxc {
     pub mod common;
 }
 
+#[cfg(target_os = "linux")]
+pub mod landlock {
+    pub mod common;
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod nanvix {
     #[cfg(feature = "microvm")]

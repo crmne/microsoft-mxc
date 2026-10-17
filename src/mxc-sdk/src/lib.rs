@@ -39,6 +39,7 @@
 //! | Backend | Host | Selected by |
 //! |---------|------|-------------|
 //! | Bubblewrap | Linux | [`v1::Containment::Process`] or [`v1::Containment::Bubblewrap`] |
+//! | Landlock | Linux | [`v1::Containment::Process`] where Bubblewrap cannot create its namespaces, or `"landlock"` in MXC request JSON (`1.1.0-alpha`) |
 //! | LXC | Linux | [`v1::Containment::Lxc`] |
 //! | Seatbelt | macOS | [`v1::Containment::Process`] or [`v1::Containment::Seatbelt`] |
 //! | ProcessContainer (AppContainer / BaseContainer) | Windows | [`v1::Containment::Process`] |
@@ -47,7 +48,8 @@
 //! | IsolationSession | Windows | [`v1::Containment::IsolationSession`] |
 //!
 //! LXC is reachable only by naming it: [`v1::Containment::Process`] resolves to
-//! Bubblewrap on Linux. It needs root. Ordinary streaming uses pipes, while
+//! Bubblewrap on Linux, or to Landlock on a host that blocks the user
+//! namespaces Bubblewrap needs. LXC needs root. Ordinary streaming uses pipes, while
 //! [`v1::spawn_with_pty`] allocates a caller-controlled terminal.
 //!
 //! WSLC requires the crate's `wslc` build feature, and IsolationSession
@@ -155,6 +157,9 @@ pub use backend_modules::isolation_session::bindings as isolation_session_bindin
 #[doc(hidden)]
 #[cfg(all(target_os = "windows", feature = "isolation_session"))]
 pub use backend_modules::isolation_session::common as isolation_session_common;
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub use backend_modules::landlock::common as landlock_common;
 #[doc(hidden)]
 pub use backend_modules::lxc::common as lxc_common;
 #[doc(hidden)]

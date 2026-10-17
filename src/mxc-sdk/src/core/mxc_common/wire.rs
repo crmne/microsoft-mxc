@@ -46,6 +46,8 @@ pub enum Containment {
     IsolationSession,
     /// Unprivileged Linux bubblewrap sandbox.
     Bubblewrap,
+    /// Unprivileged Linux Landlock sandbox.
+    Landlock,
 }
 
 impl Containment {
@@ -62,6 +64,7 @@ impl Containment {
             "seatbelt" | "macos_sandbox" => Self::Seatbelt,
             "isolation_session" => Self::IsolationSession,
             "bubblewrap" => Self::Bubblewrap,
+            "landlock" => Self::Landlock,
             _ => return None,
         })
     }
@@ -573,6 +576,7 @@ mod tests {
         ContainmentBackend::IsolationSession,
         ContainmentBackend::Seatbelt,
         ContainmentBackend::Bubblewrap,
+        ContainmentBackend::Landlock,
     ];
 
     #[test]

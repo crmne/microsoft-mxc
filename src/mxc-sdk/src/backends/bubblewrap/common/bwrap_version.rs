@@ -257,7 +257,8 @@ impl fmt::Display for BwrapUnavailable {
                     ". This host blocks unprivileged user namespaces: Ubuntu 23.10 and later \
                      restrict them with AppArmor (kernel.apparmor_restrict_unprivileged_userns), \
                      user.max_user_namespaces or kernel.unprivileged_userns_clone can be 0, and \
-                     container runtimes filter them with seccomp. Allow them for bwrap."
+                     container runtimes filter them with seccomp. Allow them for bwrap, or use \
+                     containment \"process\" or \"landlock\", which run on Landlock instead."
                 )
             }
         }
@@ -735,6 +736,7 @@ mod tests {
         assert!(message.contains("namespaces"), "{message}");
         assert!(message.contains("status 1"), "{message}");
         assert!(message.contains("setting up uid map"), "{message}");
+        assert!(message.contains("landlock"), "{message}");
     }
 
     #[test]

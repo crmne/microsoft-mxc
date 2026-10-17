@@ -215,8 +215,8 @@ fn platform_support_linux_reports_the_backends_it_can_launch() {
 
     for method in &support.available_methods {
         assert!(
-            matches!(method.as_str(), "lxc" | "bubblewrap"),
-            "only the two SDK-launchable Linux backends may be reported, got: {method}"
+            matches!(method.as_str(), "lxc" | "bubblewrap" | "landlock"),
+            "only the three SDK-launchable Linux backends may be reported, got: {method}"
         );
     }
     assert_eq!(
@@ -243,13 +243,22 @@ fn platform_support_linux_reports_the_backends_it_can_launch() {
             .any(|method| method == "bubblewrap"),
         "the bubblewrap network capability is reported exactly when bubblewrap is: {support:?}"
     );
-    if support.available_methods.len() == 2 {
-        assert_eq!(
-            support.available_methods,
-            ["lxc", "bubblewrap"],
-            "the reported order must match the TypeScript SDK's"
-        );
-    }
+    // The TypeScript SDK's order, with Landlock, which it does not know, last.
+    let order = ["lxc", "bubblewrap", "landlock"];
+    let expected: Vec<_> = order
+        .iter()
+        .filter(|name| {
+            support
+                .available_methods
+                .iter()
+                .any(|method| method == *name)
+        })
+        .collect();
+    assert_eq!(
+        support.available_methods.iter().collect::<Vec<_>>(),
+        expected,
+        "the reported order must match the TypeScript SDK's"
+    );
 }
 
 #[cfg(target_os = "windows")]

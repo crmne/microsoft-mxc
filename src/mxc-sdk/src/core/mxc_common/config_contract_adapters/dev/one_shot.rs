@@ -20,6 +20,7 @@ fn convert_containment(value: contract::OneShotContainment) -> wire::Containment
         contract::OneShotContainment::Hyperlight => wire::Containment::Hyperlight,
         contract::OneShotContainment::Wslc => wire::Containment::Wslc,
         contract::OneShotContainment::IsolationSession => wire::Containment::IsolationSession,
+        contract::OneShotContainment::Landlock => wire::Containment::Landlock,
     }
 }
 

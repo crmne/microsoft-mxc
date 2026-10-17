@@ -35,6 +35,8 @@ mod error;
 mod experimental;
 #[cfg(target_os = "windows")]
 mod guarded_capture;
+#[cfg(target_os = "linux")]
+mod host_fallback;
 mod platform;
 mod probe;
 #[cfg(target_os = "windows")]

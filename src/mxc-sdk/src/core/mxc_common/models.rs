@@ -48,6 +48,11 @@ pub enum ContainmentBackend {
     /// Uses `bwrap` to create namespace-isolated processes without root
     /// privileges. Selected on the wire as `"bubblewrap"`.
     Bubblewrap,
+    /// Landlock — unprivileged Linux sandboxing with the Landlock LSM and a
+    /// seccomp filter, without namespaces. Runs the workload as a direct child
+    /// that restricts itself before `exec`. Selected on the wire as
+    /// `"landlock"`, and used for `"process"` when Bubblewrap cannot run.
+    Landlock,
 }
 
 impl ContainmentBackend {
@@ -64,6 +69,7 @@ impl ContainmentBackend {
             ContainmentBackend::IsolationSession => "isolation_session",
             ContainmentBackend::Seatbelt => "seatbelt",
             ContainmentBackend::Bubblewrap => "bubblewrap",
+            ContainmentBackend::Landlock => "landlock",
         }
     }
 
@@ -80,6 +86,7 @@ impl ContainmentBackend {
             ContainmentBackend::IsolationSession => Some("isolationSession"),
             ContainmentBackend::Hyperlight => Some("hyperlight"),
             ContainmentBackend::Bubblewrap
+            | ContainmentBackend::Landlock
             | ContainmentBackend::MicroVm
             | ContainmentBackend::Vm => None,
         }
@@ -131,6 +138,7 @@ impl From<crate::mxc_common::wire::Containment> for ContainmentBackend {
             W::Seatbelt => Self::Seatbelt,
             W::IsolationSession => Self::IsolationSession,
             W::Bubblewrap => Self::Bubblewrap,
+            W::Landlock => Self::Landlock,
         }
     }
 }
@@ -1022,6 +1030,14 @@ pub struct ExecutionRequest {
     pub script_timeout: u32,
     /// Which containment backend to use. Default: ProcessContainer.
     pub containment: ContainmentBackend,
+    /// Whether `containment` was resolved from the abstract `"process"` intent
+    /// (or an omitted `containment`) rather than named by the caller.
+    ///
+    /// The engine may then substitute another backend of the same host when
+    /// the resolved one cannot run there: on Linux, Landlock for a Bubblewrap
+    /// that cannot create its namespaces. A backend the caller named is never
+    /// substituted.
+    pub process_intent: bool,
     /// Shared lifecycle settings.
     pub lifecycle: LifecycleConfig,
     /// ProcessContainer-specific policy (used when containment == ProcessContainer).

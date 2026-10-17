@@ -42,7 +42,8 @@ impl CommandLineContext {
             ContainmentBackend::Wslc
             | ContainmentBackend::Lxc
             | ContainmentBackend::Seatbelt
-            | ContainmentBackend::Bubblewrap => Self::PosixShell,
+            | ContainmentBackend::Bubblewrap
+            | ContainmentBackend::Landlock => Self::PosixShell,
             ContainmentBackend::ProcessContainer
             | ContainmentBackend::Vm
             | ContainmentBackend::MicroVm

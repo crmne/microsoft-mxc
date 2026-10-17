@@ -87,6 +87,10 @@ pub fn resolve_runner(
     request: &ExecutionRequest,
     logger: &mut Logger,
 ) -> Result<ResolvedRunner, Error> {
+    #[cfg(target_os = "linux")]
+    let selected = crate::mxc_engine::host_fallback::select(request, logger);
+    #[cfg(target_os = "linux")]
+    let request = selected.as_ref();
     log_policy_hash(request, logger);
     crate::mxc_engine::experimental::require_experimental_optin(
         &request.containment,
@@ -192,6 +196,13 @@ pub fn resolve_runner_for_audit(
 /// Windows, the DACL guard — in the correct order before returning the
 /// [`ScriptResponse`].
 pub fn run(request: &ExecutionRequest, logger: &mut Logger) -> Result<ScriptResponse, Error> {
+    // Selected here as well as in `resolve_runner`, so the runner is handed
+    // the request it was chosen for. Selecting twice is idempotent: a request
+    // already moved to Landlock no longer names Bubblewrap.
+    #[cfg(target_os = "linux")]
+    let selected = crate::mxc_engine::host_fallback::select(request, logger);
+    #[cfg(target_os = "linux")]
+    let request = selected.as_ref();
     let mut resolved = resolve_runner(request, logger)?;
     let response = resolved.runner.run(request, logger);
     // `resolved` drops here: `runner` first (releasing child handles), then —
@@ -281,6 +292,9 @@ fn resolve_runner_inner_windows(
         ContainmentBackend::Bubblewrap => Err(MxcError::unsupported_containment(
             "Bubblewrap backend not available on Windows",
         )),
+        ContainmentBackend::Landlock => Err(MxcError::unsupported_containment(
+            "Landlock backend not available on Windows",
+        )),
         ContainmentBackend::Seatbelt => Err(MxcError::unsupported_containment(
             "Seatbelt backend is only available on macOS (use mxc-exec-mac)",
         )),
@@ -367,6 +381,9 @@ fn resolve_runner_inner(
         }
         ContainmentBackend::Bubblewrap => Ok(ResolvedRunner::without_guard(Box::new(Runner::new(
             crate::bwrap_common::bwrap_runner::BubblewrapScriptRunner::new(),
+        )))),
+        ContainmentBackend::Landlock => Ok(ResolvedRunner::without_guard(Box::new(Runner::new(
+            crate::landlock_common::landlock_runner::LandlockScriptRunner::new(),
         )))),
         ContainmentBackend::Lxc => Ok(ResolvedRunner::without_guard(Box::new(
             crate::lxc_common::lxc_runner::LxcScriptRunner::new(

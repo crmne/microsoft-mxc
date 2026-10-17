@@ -356,7 +356,7 @@ export interface NetworkRule {
 
 export type NonEmptyString = string;
 
-export type OneShotContainment = "process" | "processcontainer" | "lxc" | "bubblewrap" | "seatbelt" | "vm" | "windows_sandbox" | "microvm" | "hyperlight" | "wslc" | "isolation_session";
+export type OneShotContainment = "process" | "processcontainer" | "lxc" | "bubblewrap" | "seatbelt" | "vm" | "windows_sandbox" | "microvm" | "hyperlight" | "wslc" | "isolation_session" | "landlock";
 
 /**
  * One-shot Hyperlight backend settings.

@@ -15,7 +15,7 @@ pub(crate) struct BackendRegistration {
     pub(crate) experimental: bool,
 }
 
-static BACKENDS: [BackendRegistration; 10] = [
+static BACKENDS: [BackendRegistration; 11] = [
     BackendRegistration {
         backend: ContainmentBackend::ProcessContainer,
         experimental: false,
@@ -56,6 +56,10 @@ static BACKENDS: [BackendRegistration; 10] = [
         backend: ContainmentBackend::Bubblewrap,
         experimental: false,
     },
+    BackendRegistration {
+        backend: ContainmentBackend::Landlock,
+        experimental: false,
+    },
 ];
 
 /// Every new backend must select a registration; there is no implicit default.
@@ -71,6 +75,7 @@ pub(crate) fn registration(backend: &ContainmentBackend) -> &'static BackendRegi
         ContainmentBackend::IsolationSession => 7,
         ContainmentBackend::Seatbelt => 8,
         ContainmentBackend::Bubblewrap => 9,
+        ContainmentBackend::Landlock => 10,
     };
     &BACKENDS[index]
 }
@@ -87,7 +92,7 @@ mod tests {
             assert!(names.insert(entry.backend.wire_name()));
             assert!(std::ptr::eq(registration(&entry.backend), entry));
         }
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]

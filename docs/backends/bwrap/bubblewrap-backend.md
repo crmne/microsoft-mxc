@@ -54,8 +54,9 @@ requiring root privileges or a container runtime.
   them (Ubuntu 23.10 and later with AppArmor's
   `kernel.apparmor_restrict_unprivileged_userns=1`,
   `user.max_user_namespaces=0`, or a container's seccomp profile) reports the
-  backend unavailable with `bwrap`'s message, and a request fails validation
-  with it (`backend_unavailable`).
+  backend unavailable with `bwrap`'s message, and a request naming
+  `"bubblewrap"` fails validation with it. `"process"` then runs on the
+  [Landlock backend](../landlock/landlock-backend.md) instead, with a warning.
   A sandbox whose setup fails after `bwrap` started (a mount it cannot make)
   is reported as an error from `wait`, never as the workload's exit status:
   the runner passes `--json-status-fd` and treats a `bwrap` that exited without

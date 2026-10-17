@@ -530,7 +530,7 @@ force a particular backend.
 
 | Value | Resolution |
 |-------|------------|
-| `"process"` | `processcontainer` on Windows, `bubblewrap` on Linux, `seatbelt` on macOS |
+| `"process"` | `processcontainer` on Windows, `bubblewrap` on Linux (`landlock` where Bubblewrap cannot create its namespaces), `seatbelt` on macOS |
 | `"vm"` | Full hardware-virtualised VM isolation. Resolves to `windows_sandbox` on Windows. |
 | `"microvm"` | MicroVM on Windows (NanVix via the Windows Hypervisor Platform). Experimental. |
 
@@ -547,6 +547,7 @@ force a particular backend.
 | `"isolation_session"` | Windows isolation session: create-and-run execution uses a freshly provisioned isolated user account in its own OS-managed session. Container lifecycle operations can retain the session between executions. |
 | `"seatbelt"` | macOS sandbox isolation (Seatbelt). Requires macOS 15 or later — see [`docs/backends/seatbelt/seatbelt-backend.md`](backends/seatbelt/seatbelt-backend.md). |
 | `"bubblewrap"` | Unprivileged Linux sandboxing via Bubblewrap/user namespaces. The Linux default — see [`docs/backends/bwrap/bubblewrap-backend.md`](backends/bwrap/bubblewrap-backend.md). |
+| `"landlock"` | Unprivileged Linux sandboxing via the Landlock LSM and a seccomp filter, without namespaces. Development contract (`1.1.0-alpha`) only; refuses network and filesystem policies Landlock cannot express — see [`docs/backends/landlock/landlock-backend.md`](backends/landlock/landlock-backend.md). |
 
 Only the backend section matching the selected `containment` value is accepted;
 a config that also carries an unrelated backend's section is **rejected** with a

@@ -177,14 +177,15 @@ impl ResourcePolicySupport {
     ///
     /// Bubblewrap sets rlimits and a nice value on `bwrap`, which every
     /// process in the sandbox inherits. It has no per-workload process
-    /// counter: `RLIMIT_NPROC` counts every process of the user. Seatbelt
+    /// counter: `RLIMIT_NPROC` counts every process of the user. Landlock
+    /// applies the same limits to the workload it starts directly. Seatbelt
     /// does the same on the process it launches, but macOS rejects memory
     /// rlimits (`RLIMIT_DATA`, `RLIMIT_AS`, `RLIMIT_RSS`) with `EINVAL`.
     /// ProcessContainer enforces every limit through the job object its
     /// workload is assigned to before it is resumed.
     pub const fn for_backend(backend: &ContainmentBackend) -> Self {
         match backend {
-            ContainmentBackend::Bubblewrap => {
+            ContainmentBackend::Bubblewrap | ContainmentBackend::Landlock => {
                 Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::PRIORITY.0)
             }
             ContainmentBackend::Seatbelt => Self(Self::CPU_TIME.0 | Self::PRIORITY.0),
