@@ -564,6 +564,7 @@ impl BubblewrapScriptRunner {
 
         // 3. Spawn `bwrap`.
         let mut command = Command::new("bwrap");
+        bwrap_command::clean_host_environment(&mut command);
         command.args(&args);
         let pty = match stdio {
             StdioMode::Pipes => {

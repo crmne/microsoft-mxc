@@ -367,6 +367,34 @@ fn resolved_env(request: &ExecutionRequest) -> Vec<String> {
     crate::mxc_common::default_env::resolve_env(request, || default_env(request))
 }
 
+/// What `bwrap` and the proxy-network supervisor keep of the caller's
+/// environment: `PATH` to find their tools, and the settings of the wrapper
+/// script the gem's Docker guide installs as `bwrap`.
+#[cfg(target_os = "linux")]
+const KEPT_HOST_VARIABLES: [&str; 4] = [
+    "PATH",
+    "MXC_BWRAP_PROC",
+    "MXC_REAL_BWRAP",
+    "MXC_USERNS_FILTER",
+];
+
+/// Clears `command`'s inherited environment, keeping [`KEPT_HOST_VARIABLES`].
+///
+/// SECURITY: `--clearenv` only cleans the workload. `bwrap` itself is PID 1 of
+/// the sandbox, in the workload's user namespace and with its uid, so the
+/// workload can read `/proc/1/environ` and `/proc/1/mem`. The proxy-network
+/// supervisor shares that user namespace too. Whatever these processes are
+/// started with must be safe for the workload to read.
+#[cfg(target_os = "linux")]
+pub(crate) fn clean_host_environment(command: &mut std::process::Command) {
+    command.env_clear();
+    for name in KEPT_HOST_VARIABLES {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
 /// Build the complete `bwrap` argument list, masking **every** denied path as a
 /// directory (`--tmpfs`).
 ///
@@ -552,6 +580,21 @@ pub(crate) fn build_args_classified_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_helpers_start_with_only_the_kept_variables() {
+        let mut command = std::process::Command::new("env");
+        clean_host_environment(&mut command);
+        let output = command.output().expect("env runs");
+        let printed = String::from_utf8_lossy(&output.stdout);
+        let unexpected: Vec<&str> = printed
+            .lines()
+            .filter_map(|line| line.split('=').next())
+            .filter(|name| !KEPT_HOST_VARIABLES.contains(name))
+            .collect();
+        assert!(unexpected.is_empty(), "inherited: {unexpected:?}");
+    }
 
     fn base_request() -> ExecutionRequest {
         ExecutionRequest {

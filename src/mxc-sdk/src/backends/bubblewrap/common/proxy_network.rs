@@ -784,6 +784,7 @@ impl ProxyNetworkNamespace {
         set_nonblocking(liveness_reader.as_raw_fd())?;
 
         let mut command = Command::new("unshare");
+        super::bwrap_command::clean_host_environment(&mut command);
         command
             .args([
                 "--user",
