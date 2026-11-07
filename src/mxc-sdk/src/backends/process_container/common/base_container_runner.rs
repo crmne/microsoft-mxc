@@ -1254,8 +1254,15 @@ struct BaseChild {
 }
 
 impl SandboxBackend for BaseContainerRunner {
+    /// Every feature but the outbound host-loopback ports and the blocked
+    /// connection answer and log, which only Bubblewrap and Seatbelt hold.
     fn network_policy_support(&self) -> NetworkPolicySupport {
-        NetworkPolicySupport::ALL
+        NetworkPolicySupport::EGRESS_DEFAULT
+            | NetworkPolicySupport::EGRESS_RULES
+            | NetworkPolicySupport::INGRESS_DEFAULT
+            | NetworkPolicySupport::HOST_LOOPBACK
+            | NetworkPolicySupport::RUNTIME_PROXY
+            | NetworkPolicySupport::PROXY_PEER_IDENTITY
     }
 
     fn validate(&self, request: &ExecutionRequest) -> Result<(), ScriptResponse> {
@@ -3109,6 +3116,7 @@ mod tests {
                         default: Some(wire::NetworkAction::Deny),
                         allow: None,
                         deny: None,
+                        ..Default::default()
                     }),
                     ingress: None,
                 }),
@@ -3620,6 +3628,7 @@ mod tests {
                     end_port: Some(8080),
                 }],
             }],
+            ..Default::default()
         });
         request
     }
@@ -3693,6 +3702,7 @@ mod tests {
                 ],
             }],
             deny: Vec::new(),
+            ..Default::default()
         });
 
         let bytes = BaseContainerRunner::build_process_security_environment_spec(&request);
@@ -3743,6 +3753,7 @@ mod tests {
                     }],
                 }],
                 deny: Vec::new(),
+                ..Default::default()
             });
 
             let bytes = BaseContainerRunner::build_process_security_environment_spec(&request);
@@ -3781,6 +3792,7 @@ mod tests {
                 to: vec![peer],
                 ports: Vec::new(),
             }],
+            ..Default::default()
         });
 
         let bytes = BaseContainerRunner::build_process_security_environment_spec(&request);

@@ -268,6 +268,7 @@ impl PolicyInput {
                     default: egress.default.map(ActionInput::into_policy),
                     allow: rules(egress.allow),
                     deny: rules(egress.deny),
+                    ..Default::default()
                 }),
                 ingress: network.ingress.map(|ingress| NetworkIngressPolicy {
                     default: ingress.default.map(ActionInput::into_policy),

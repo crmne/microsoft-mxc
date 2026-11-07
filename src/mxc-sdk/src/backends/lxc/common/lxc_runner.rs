@@ -3010,6 +3010,7 @@ mod tests {
                 ports: Vec::new(),
             }],
             deny: Vec::new(),
+            ..Default::default()
         });
         request
     }
