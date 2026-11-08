@@ -1594,6 +1594,14 @@ fn normalize_common_request_ir(
     // otherwise indistinguishable from an absent one, and a backend that cannot
     // honor UI restrictions has no way to tell "caller asked for lockdown" from
     // "caller said nothing". Twin of `network_specified`.
+    policy.cgroup = match cfg.resources.as_ref().and_then(|raw| raw.cgroup.clone()) {
+        Some(path) if !std::path::Path::new(&path).is_absolute() => {
+            return Err(WxcError::ConfigParse(
+                "resources.cgroup must be an absolute path".to_string(),
+            ));
+        }
+        cgroup => cgroup,
+    };
     policy.resources = cfg.resources.map(|raw| ResourcePolicy {
         cpu_time_ms: raw.cpu_time_ms,
         memory_mb: raw.memory_mb,
@@ -4710,6 +4718,31 @@ mod tests {
                 priority: crate::mxc_common::models::ResourcePriority::Idle,
             })
         );
+    }
+
+    #[test]
+    fn a_cgroup_must_be_named_by_an_absolute_path() {
+        let policy = one_shot_policy(
+            r#"{
+                "version": "1.1.0-alpha",
+                "process": {"commandLine": "echo hello"},
+                "resources": {"memoryMb": 256, "cgroup": "/sys/fs/cgroup/user.slice/run-1"}
+            }"#,
+        );
+        assert_eq!(
+            policy.cgroup.as_deref(),
+            Some("/sys/fs/cgroup/user.slice/run-1")
+        );
+        assert_eq!(policy.resources.unwrap().memory_mb, Some(256));
+
+        let relative = parse_exact_for_test(
+            r#"{
+                "version": "1.1.0-alpha",
+                "process": {"commandLine": "echo hello"},
+                "resources": {"cgroup": "run-1"}
+            }"#,
+        );
+        assert!(relative.is_err());
     }
 
     #[test]

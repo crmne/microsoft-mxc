@@ -245,6 +245,14 @@ impl SandboxBackend for LandlockScriptRunner {
         if let Some(limits) = resource_limits {
             limits.apply_to(&mut command);
         }
+        // Before Landlock, which would refuse the write to the cgroup.
+        if let Some(cgroup) = request.policy.cgroup.as_deref() {
+            if let Err(error) = crate::mxc_unix_resources::join_cgroup(&mut command, cgroup) {
+                return Err(ScriptResponse::error(&format!(
+                    "Landlock: can't join resources.cgroup: {error}"
+                )));
+            }
+        }
         // Last, so the workload is confined only after every other step.
         restriction.apply_to(&mut command);
 

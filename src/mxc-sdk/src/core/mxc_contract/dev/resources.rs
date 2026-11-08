@@ -38,4 +38,11 @@ pub struct Resources {
     /// Scheduling priority for every process in the workload.
     #[serde(default)]
     pub priority: OptionalField<ResourcePriority>,
+    /// An existing cgroup v2 directory, by absolute path, that the
+    /// workload's first process joins before it starts, so the cgroup's own
+    /// limits (`memory.max`, `pids.max`) hold for the whole workload. The
+    /// caller makes it, sets its limits, and removes it afterwards.
+    /// Bubblewrap and Landlock only.
+    #[serde(default)]
+    pub cgroup: OptionalField<String>,
 }

@@ -95,6 +95,36 @@ impl UnixResourceLimits {
     }
 }
 
+/// Make the process `command` spawns join the cgroup v2 directory `cgroup`
+/// (`resources.cgroup`) between `fork` and `exec`, so it and everything it
+/// starts are held by that cgroup's limits from their first instruction. A
+/// cgroup that can't be joined fails the spawn.
+#[cfg(target_os = "linux")]
+pub fn join_cgroup(command: &mut Command, cgroup: &str) -> io::Result<()> {
+    let procs = std::ffi::CString::new(format!("{}/cgroup.procs", cgroup.trim_end_matches('/')))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a cgroup path holds a NUL"))?;
+    // SAFETY: the closure runs between fork() and exec(). It only makes the
+    // async-signal-safe open, write and close system calls on a path copied
+    // before the fork, and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // "0" is the writing process itself.
+            let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
+            let error = io::Error::last_os_error();
+            libc::close(fd);
+            if written != 2 {
+                return Err(error);
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 /// Set both the soft and the hard limit to `value`, or keep a lower existing
 /// hard limit. Equal soft and hard limits leave the workload no headroom to
 /// raise its own limit.

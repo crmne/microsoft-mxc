@@ -205,6 +205,10 @@ impl ResourcePolicySupport {
     /// Support for a non-normal `resources.priority`.
     pub const PRIORITY: Self = Self(1 << 3);
 
+    /// Support for `resources.cgroup`: the workload joins a cgroup the
+    /// caller made, before it starts.
+    pub const CGROUP: Self = Self(1 << 4);
+
     /// A backend that enforces every resource limit.
     pub const ALL: Self =
         Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::MAX_PROCESSES.0 | Self::PRIORITY.0);
@@ -223,7 +227,7 @@ impl ResourcePolicySupport {
     pub const fn for_backend(backend: &ContainmentBackend) -> Self {
         match backend {
             ContainmentBackend::Bubblewrap | ContainmentBackend::Landlock => {
-                Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::PRIORITY.0)
+                Self(Self::CPU_TIME.0 | Self::MEMORY.0 | Self::PRIORITY.0 | Self::CGROUP.0)
             }
             ContainmentBackend::Seatbelt => Self(Self::CPU_TIME.0 | Self::PRIORITY.0),
             ContainmentBackend::ProcessContainer => Self::ALL,
@@ -260,10 +264,15 @@ pub fn validate_resource_policy_support(
     request: &ExecutionRequest,
     support: ResourcePolicySupport,
 ) -> Result<(), ScriptResponse> {
+    let backend = request.containment.wire_name();
+    if request.policy.cgroup.is_some() && !support.contains(ResourcePolicySupport::CGROUP) {
+        return Err(ScriptResponse::rejected(&format!(
+            "resources.cgroup is not supported by the '{backend}' backend"
+        )));
+    }
     let Some(resources) = request.policy.resources.as_ref() else {
         return Ok(());
     };
-    let backend = request.containment.wire_name();
     if support.is_empty() {
         return Err(ScriptResponse::rejected(&format!(
             "resources is not supported by the '{backend}' backend"
@@ -797,6 +806,30 @@ mod tests {
         resources.memory_mb = None;
         let request = request_with_resources(ContainmentBackend::Seatbelt, resources);
         assert!(validate_common(&request).is_ok());
+    }
+
+    #[test]
+    fn only_bubblewrap_and_landlock_join_a_cgroup() {
+        for (backend, joins) in [
+            (ContainmentBackend::Bubblewrap, true),
+            (ContainmentBackend::Landlock, true),
+            (ContainmentBackend::Seatbelt, false),
+            (ContainmentBackend::ProcessContainer, false),
+        ] {
+            let mut request = request_with_resources(
+                backend.clone(),
+                crate::mxc_common::models::ResourcePolicy::default(),
+            );
+            request.policy.cgroup = Some("/sys/fs/cgroup/run".to_string());
+            let checked = validate_common(&request);
+            assert_eq!(checked.is_ok(), joins, "{backend:?}");
+            if !joins {
+                assert!(checked
+                    .unwrap_err()
+                    .error_message
+                    .contains("resources.cgroup"));
+            }
+        }
     }
 
     #[test]

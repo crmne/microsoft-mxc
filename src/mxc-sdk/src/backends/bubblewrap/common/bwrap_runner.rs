@@ -625,6 +625,16 @@ impl BubblewrapScriptRunner {
         if let Some(limits) = resource_limits {
             limits.apply_to(&mut command);
         }
+        // bwrap joins it before it starts, so the whole sandbox is held by
+        // the cgroup's limits.
+        if let Some(cgroup) = request.policy.cgroup.as_deref() {
+            if let Err(error) = crate::mxc_unix_resources::join_cgroup(&mut command, cgroup) {
+                stop_proxy_network(&mut proxy_network, logger);
+                return Err(ScriptResponse::error(&format!(
+                    "Bubblewrap: can't join resources.cgroup: {error}"
+                )));
+            }
+        }
 
         let mut child = match command.spawn() {
             Ok(process) => process,

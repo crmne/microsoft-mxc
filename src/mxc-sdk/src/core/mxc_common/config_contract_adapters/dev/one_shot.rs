@@ -82,12 +82,14 @@ fn convert_resources(value: contract::Resources) -> wire::Resources {
         memory_mb,
         max_processes,
         priority,
+        cgroup,
     } = value;
     wire::Resources {
         cpu_time_ms: cpu_time_ms.into_option().map(std::num::NonZeroU64::get),
         memory_mb: memory_mb.into_option().map(std::num::NonZeroU64::get),
         max_processes: max_processes.into_option().map(std::num::NonZeroU32::get),
         priority: priority.into_option().map(convert_resource_priority),
+        cgroup: cgroup.into_option(),
     }
 }
 

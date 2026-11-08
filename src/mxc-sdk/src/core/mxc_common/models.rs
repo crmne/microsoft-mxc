@@ -758,6 +758,11 @@ pub struct ContainerPolicy {
     /// `None` leaves resources unlimited and unreported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcePolicy>,
+    /// A cgroup v2 directory, by absolute path, the workload's first process
+    /// joins before it starts (from `resources.cgroup`), so the cgroup's
+    /// limits hold for the whole workload. The caller owns the cgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
 }
 
 /// Scheduling priority for a workload (from `resources.priority`).

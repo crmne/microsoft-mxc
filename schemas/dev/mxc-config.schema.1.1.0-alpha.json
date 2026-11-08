@@ -1299,6 +1299,10 @@
       "additionalProperties": false,
       "description": "Resource limits for the workload, and a request for its resource usage.\n\nSupplying this object, even empty, asks the backend to report the workload's resource usage with its result. Every field is optional; an omitted field leaves that resource unlimited.",
       "properties": {
+        "cgroup": {
+          "description": "An existing cgroup v2 directory, by absolute path, that the workload's first process joins before it starts, so the cgroup's own limits (`memory.max`, `pids.max`) hold for the whole workload. The caller makes it, sets its limits, and removes it afterwards. Bubblewrap and Landlock only.",
+          "type": "string"
+        },
         "cpuTimeMs": {
           "description": "CPU time each process in the workload may use, in milliseconds.",
           "maximum": 18446744073709551615,

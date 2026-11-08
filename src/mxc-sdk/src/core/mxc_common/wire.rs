@@ -476,6 +476,8 @@ pub struct Resources {
     pub max_processes: Option<u32>,
     /// Scheduling priority for every process in the workload.
     pub priority: Option<crate::mxc_common::models::ResourcePriority>,
+    /// A cgroup v2 directory the workload joins before it starts.
+    pub cgroup: Option<String>,
 }
 
 /// Placeholder experimental feature.
